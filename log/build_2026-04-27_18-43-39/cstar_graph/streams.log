@@ -1,0 +1,17 @@
+[0.542s] Invoking command in '/home/admin/yahboomcar_cstar/build/cstar_graph': PYTHONPATH=/home/admin/yahboomcar_cstar/build/cstar_graph/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/admin/yahboomcar_cstar/install/cstar_graph/lib/python3.10/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py develop --editable --build-directory /home/admin/yahboomcar_cstar/build/cstar_graph/build --no-deps symlink_data
+[0.768s] running develop
+[0.891s] running egg_info
+[0.891s] writing cstar_graph.egg-info/PKG-INFO
+[0.891s] writing dependency_links to cstar_graph.egg-info/dependency_links.txt
+[0.891s] writing entry points to cstar_graph.egg-info/entry_points.txt
+[0.892s] writing requirements to cstar_graph.egg-info/requires.txt
+[0.892s] writing top-level names to cstar_graph.egg-info/top_level.txt
+[0.893s] reading manifest file 'cstar_graph.egg-info/SOURCES.txt'
+[0.893s] writing manifest file 'cstar_graph.egg-info/SOURCES.txt'
+[0.895s] running build_ext
+[0.895s] Creating /home/admin/yahboomcar_cstar/install/cstar_graph/lib/python3.10/site-packages/cstar-graph.egg-link (link to .)
+[0.896s] Installing cstar_rcg_node script to /home/admin/yahboomcar_cstar/install/cstar_graph/lib/cstar_graph
+[0.896s] 
+[0.896s] Installed /home/admin/yahboomcar_cstar/build/cstar_graph
+[0.896s] running symlink_data
+[0.916s] Invoked command in '/home/admin/yahboomcar_cstar/build/cstar_graph' returned '0': PYTHONPATH=/home/admin/yahboomcar_cstar/build/cstar_graph/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/admin/yahboomcar_cstar/install/cstar_graph/lib/python3.10/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py develop --editable --build-directory /home/admin/yahboomcar_cstar/build/cstar_graph/build --no-deps symlink_data

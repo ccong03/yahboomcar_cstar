@@ -1,0 +1,13 @@
+package.xml
+setup.cfg
+setup.py
+cstar_graph/__init__.py
+cstar_graph/cstar_rcg_node.py
+cstar_graph.egg-info/PKG-INFO
+cstar_graph.egg-info/SOURCES.txt
+cstar_graph.egg-info/dependency_links.txt
+cstar_graph.egg-info/entry_points.txt
+cstar_graph.egg-info/requires.txt
+cstar_graph.egg-info/top_level.txt
+cstar_graph.egg-info/zip-safe
+resource/cstar_graph

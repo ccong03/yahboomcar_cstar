@@ -1,0 +1,23 @@
+[1.795s] Invoking command in '/home/admin/yahboomcar_cstar/build/cstar_graph': PYTHONPATH=/home/admin/yahboomcar_cstar/build/cstar_graph/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/admin/yahboomcar_cstar/install/cstar_graph/lib/python3.10/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py develop --editable --build-directory /home/admin/yahboomcar_cstar/build/cstar_graph/build --no-deps symlink_data
+[2.010s] running develop
+[2.128s] running egg_info
+[2.128s] creating cstar_graph.egg-info
+[2.128s] writing cstar_graph.egg-info/PKG-INFO
+[2.128s] writing dependency_links to cstar_graph.egg-info/dependency_links.txt
+[2.128s] writing entry points to cstar_graph.egg-info/entry_points.txt
+[2.129s] writing requirements to cstar_graph.egg-info/requires.txt
+[2.129s] writing top-level names to cstar_graph.egg-info/top_level.txt
+[2.129s] writing manifest file 'cstar_graph.egg-info/SOURCES.txt'
+[2.129s] reading manifest file 'cstar_graph.egg-info/SOURCES.txt'
+[2.130s] writing manifest file 'cstar_graph.egg-info/SOURCES.txt'
+[2.131s] running build_ext
+[2.132s] Creating /home/admin/yahboomcar_cstar/install/cstar_graph/lib/python3.10/site-packages/cstar-graph.egg-link (link to .)
+[2.132s] 
+[2.132s] Installed /home/admin/yahboomcar_cstar/build/cstar_graph
+[2.132s] running symlink_data
+[2.132s] creating /home/admin/yahboomcar_cstar/install/cstar_graph/share/ament_index
+[2.132s] creating /home/admin/yahboomcar_cstar/install/cstar_graph/share/ament_index/resource_index
+[2.132s] creating /home/admin/yahboomcar_cstar/install/cstar_graph/share/ament_index/resource_index/packages
+[2.133s] symbolically linking /home/admin/yahboomcar_cstar/build/cstar_graph/resource/cstar_graph -> /home/admin/yahboomcar_cstar/install/cstar_graph/share/ament_index/resource_index/packages
+[2.134s] symbolically linking /home/admin/yahboomcar_cstar/build/cstar_graph/package.xml -> /home/admin/yahboomcar_cstar/install/cstar_graph/share/cstar_graph
+[2.178s] Invoked command in '/home/admin/yahboomcar_cstar/build/cstar_graph' returned '0': PYTHONPATH=/home/admin/yahboomcar_cstar/build/cstar_graph/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/admin/yahboomcar_cstar/install/cstar_graph/lib/python3.10/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py develop --editable --build-directory /home/admin/yahboomcar_cstar/build/cstar_graph/build --no-deps symlink_data

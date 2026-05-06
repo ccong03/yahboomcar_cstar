@@ -1,0 +1,21 @@
+running develop
+running egg_info
+creating cstar_metrics.egg-info
+writing cstar_metrics.egg-info/PKG-INFO
+writing dependency_links to cstar_metrics.egg-info/dependency_links.txt
+writing entry points to cstar_metrics.egg-info/entry_points.txt
+writing requirements to cstar_metrics.egg-info/requires.txt
+writing top-level names to cstar_metrics.egg-info/top_level.txt
+writing manifest file 'cstar_metrics.egg-info/SOURCES.txt'
+reading manifest file 'cstar_metrics.egg-info/SOURCES.txt'
+writing manifest file 'cstar_metrics.egg-info/SOURCES.txt'
+running build_ext
+Creating /home/admin/yahboomcar_cstar/install/cstar_metrics/lib/python3.10/site-packages/cstar-metrics.egg-link (link to .)
+
+Installed /home/admin/yahboomcar_cstar/build/cstar_metrics
+running symlink_data
+creating /home/admin/yahboomcar_cstar/install/cstar_metrics/share/ament_index
+creating /home/admin/yahboomcar_cstar/install/cstar_metrics/share/ament_index/resource_index
+creating /home/admin/yahboomcar_cstar/install/cstar_metrics/share/ament_index/resource_index/packages
+symbolically linking /home/admin/yahboomcar_cstar/build/cstar_metrics/resource/cstar_metrics -> /home/admin/yahboomcar_cstar/install/cstar_metrics/share/ament_index/resource_index/packages
+symbolically linking /home/admin/yahboomcar_cstar/build/cstar_metrics/package.xml -> /home/admin/yahboomcar_cstar/install/cstar_metrics/share/cstar_metrics

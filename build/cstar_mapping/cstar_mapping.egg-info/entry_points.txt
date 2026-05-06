@@ -1,0 +1,5 @@
+[console_scripts]
+cstar_frontier_node = cstar_mapping.cstar_frontier_node:main
+cstar_hole_detector_node = cstar_mapping.cstar_hole_detector_node:main
+cstar_map_state_node = cstar_mapping.cstar_map_state_node:main
+

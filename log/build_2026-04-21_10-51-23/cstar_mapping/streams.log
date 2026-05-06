@@ -1,0 +1,17 @@
+[0.539s] Invoking command in '/home/admin/yahboomcar_cstar/build/cstar_mapping': PYTHONPATH=/home/admin/yahboomcar_cstar/build/cstar_mapping/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/admin/yahboomcar_cstar/install/cstar_mapping/lib/python3.10/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py develop --editable --build-directory /home/admin/yahboomcar_cstar/build/cstar_mapping/build --no-deps symlink_data
+[0.771s] running develop
+[0.898s] running egg_info
+[0.898s] writing cstar_mapping.egg-info/PKG-INFO
+[0.898s] writing dependency_links to cstar_mapping.egg-info/dependency_links.txt
+[0.898s] writing entry points to cstar_mapping.egg-info/entry_points.txt
+[0.898s] writing requirements to cstar_mapping.egg-info/requires.txt
+[0.898s] writing top-level names to cstar_mapping.egg-info/top_level.txt
+[0.900s] reading manifest file 'cstar_mapping.egg-info/SOURCES.txt'
+[0.900s] writing manifest file 'cstar_mapping.egg-info/SOURCES.txt'
+[0.902s] running build_ext
+[0.902s] Creating /home/admin/yahboomcar_cstar/install/cstar_mapping/lib/python3.10/site-packages/cstar-mapping.egg-link (link to .)
+[0.903s] Installing cstar_map_state_node script to /home/admin/yahboomcar_cstar/install/cstar_mapping/lib/cstar_mapping
+[0.903s] 
+[0.903s] Installed /home/admin/yahboomcar_cstar/build/cstar_mapping
+[0.903s] running symlink_data
+[0.925s] Invoked command in '/home/admin/yahboomcar_cstar/build/cstar_mapping' returned '0': PYTHONPATH=/home/admin/yahboomcar_cstar/build/cstar_mapping/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/admin/yahboomcar_cstar/install/cstar_mapping/lib/python3.10/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py develop --editable --build-directory /home/admin/yahboomcar_cstar/build/cstar_mapping/build --no-deps symlink_data

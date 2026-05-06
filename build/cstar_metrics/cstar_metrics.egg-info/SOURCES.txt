@@ -1,0 +1,12 @@
+package.xml
+setup.cfg
+setup.py
+cstar_metrics/__init__.py
+cstar_metrics.egg-info/PKG-INFO
+cstar_metrics.egg-info/SOURCES.txt
+cstar_metrics.egg-info/dependency_links.txt
+cstar_metrics.egg-info/entry_points.txt
+cstar_metrics.egg-info/requires.txt
+cstar_metrics.egg-info/top_level.txt
+cstar_metrics.egg-info/zip-safe
+resource/cstar_metrics

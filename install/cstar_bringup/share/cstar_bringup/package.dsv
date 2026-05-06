@@ -1,0 +1,9 @@
+source;share/cstar_bringup/hook/pythonpath.ps1
+source;share/cstar_bringup/hook/pythonpath.dsv
+source;share/cstar_bringup/hook/pythonpath.sh
+source;share/cstar_bringup/hook/ament_prefix_path.ps1
+source;share/cstar_bringup/hook/ament_prefix_path.dsv
+source;share/cstar_bringup/hook/ament_prefix_path.sh
+source;../../build/cstar_bringup/share/cstar_bringup/hook/pythonpath_develop.ps1
+source;../../build/cstar_bringup/share/cstar_bringup/hook/pythonpath_develop.dsv
+source;../../build/cstar_bringup/share/cstar_bringup/hook/pythonpath_develop.sh

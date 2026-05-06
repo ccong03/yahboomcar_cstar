@@ -1,0 +1,23 @@
+[1.779s] Invoking command in '/home/admin/yahboomcar_cstar/build/cstar_planner': PYTHONPATH=/home/admin/yahboomcar_cstar/build/cstar_planner/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/admin/yahboomcar_cstar/install/cstar_planner/lib/python3.10/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py develop --editable --build-directory /home/admin/yahboomcar_cstar/build/cstar_planner/build --no-deps symlink_data
+[1.994s] running develop
+[2.114s] running egg_info
+[2.114s] creating cstar_planner.egg-info
+[2.114s] writing cstar_planner.egg-info/PKG-INFO
+[2.114s] writing dependency_links to cstar_planner.egg-info/dependency_links.txt
+[2.114s] writing entry points to cstar_planner.egg-info/entry_points.txt
+[2.114s] writing requirements to cstar_planner.egg-info/requires.txt
+[2.114s] writing top-level names to cstar_planner.egg-info/top_level.txt
+[2.115s] writing manifest file 'cstar_planner.egg-info/SOURCES.txt'
+[2.116s] reading manifest file 'cstar_planner.egg-info/SOURCES.txt'
+[2.116s] writing manifest file 'cstar_planner.egg-info/SOURCES.txt'
+[2.117s] running build_ext
+[2.118s] Creating /home/admin/yahboomcar_cstar/install/cstar_planner/lib/python3.10/site-packages/cstar-planner.egg-link (link to .)
+[2.118s] 
+[2.118s] Installed /home/admin/yahboomcar_cstar/build/cstar_planner
+[2.118s] running symlink_data
+[2.118s] creating /home/admin/yahboomcar_cstar/install/cstar_planner/share/ament_index
+[2.118s] creating /home/admin/yahboomcar_cstar/install/cstar_planner/share/ament_index/resource_index
+[2.118s] creating /home/admin/yahboomcar_cstar/install/cstar_planner/share/ament_index/resource_index/packages
+[2.118s] symbolically linking /home/admin/yahboomcar_cstar/build/cstar_planner/resource/cstar_planner -> /home/admin/yahboomcar_cstar/install/cstar_planner/share/ament_index/resource_index/packages
+[2.118s] symbolically linking /home/admin/yahboomcar_cstar/build/cstar_planner/package.xml -> /home/admin/yahboomcar_cstar/install/cstar_planner/share/cstar_planner
+[2.164s] Invoked command in '/home/admin/yahboomcar_cstar/build/cstar_planner' returned '0': PYTHONPATH=/home/admin/yahboomcar_cstar/build/cstar_planner/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/admin/yahboomcar_cstar/install/cstar_planner/lib/python3.10/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py develop --editable --build-directory /home/admin/yahboomcar_cstar/build/cstar_planner/build --no-deps symlink_data

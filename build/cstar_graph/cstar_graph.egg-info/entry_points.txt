@@ -1,0 +1,3 @@
+[console_scripts]
+cstar_rcg_node = cstar_graph.cstar_rcg_node:main
+

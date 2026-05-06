@@ -1,0 +1,3 @@
+[console_scripts]
+cstar_simple_controller_node = cstar_controller.cstar_simple_controller_node:main
+

@@ -1,0 +1,21 @@
+running develop
+running egg_info
+creating cstar_graph.egg-info
+writing cstar_graph.egg-info/PKG-INFO
+writing dependency_links to cstar_graph.egg-info/dependency_links.txt
+writing entry points to cstar_graph.egg-info/entry_points.txt
+writing requirements to cstar_graph.egg-info/requires.txt
+writing top-level names to cstar_graph.egg-info/top_level.txt
+writing manifest file 'cstar_graph.egg-info/SOURCES.txt'
+reading manifest file 'cstar_graph.egg-info/SOURCES.txt'
+writing manifest file 'cstar_graph.egg-info/SOURCES.txt'
+running build_ext
+Creating /home/admin/yahboomcar_cstar/install/cstar_graph/lib/python3.10/site-packages/cstar-graph.egg-link (link to .)
+
+Installed /home/admin/yahboomcar_cstar/build/cstar_graph
+running symlink_data
+creating /home/admin/yahboomcar_cstar/install/cstar_graph/share/ament_index
+creating /home/admin/yahboomcar_cstar/install/cstar_graph/share/ament_index/resource_index
+creating /home/admin/yahboomcar_cstar/install/cstar_graph/share/ament_index/resource_index/packages
+symbolically linking /home/admin/yahboomcar_cstar/build/cstar_graph/resource/cstar_graph -> /home/admin/yahboomcar_cstar/install/cstar_graph/share/ament_index/resource_index/packages
+symbolically linking /home/admin/yahboomcar_cstar/build/cstar_graph/package.xml -> /home/admin/yahboomcar_cstar/install/cstar_graph/share/cstar_graph
