@@ -2,6 +2,7 @@ package.xml
 setup.cfg
 setup.py
 cstar_planner/__init__.py
+cstar_planner/cstar_waypoint_planner_node copy.py
 cstar_planner/cstar_waypoint_planner_node.py
 cstar_planner.egg-info/PKG-INFO
 cstar_planner.egg-info/SOURCES.txt

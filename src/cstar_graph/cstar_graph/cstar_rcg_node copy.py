@@ -34,40 +34,22 @@ class CStarRCGNode(Node):
         self.declare_parameter('unknown_topic', '/cstar/unknown_map')
         self.declare_parameter('map_frame', 'map')
 
-        # RCG 基础采样参数
-        self.declare_parameter('lap_spacing', 0.30)
-        self.declare_parameter('sample_spacing', 0.25)
+        self.declare_parameter('lap_spacing', 0.30) #lap的疏密程度 原始0.35 稳定0.30
+        self.declare_parameter('sample_spacing', 0.25) #sample的间距 原始0.22 稳定0.25
 
         self.declare_parameter('frontier_keep_radius', 0.25)
         self.declare_parameter('interlap_max_dist', 0.55)
-        self.declare_parameter('prune_stride', 2) #原始2
+        self.declare_parameter('prune_stride', 2)
         self.declare_parameter('publish_period', 1.0)
 
-        # 安全缓冲区，单位：米
-        self.declare_parameter('obstacle_buffer', 0.15)
-        self.declare_parameter('unknown_buffer', 0.08)
-        self.declare_parameter('map_border_buffer', 0.08)
+        # 安全缓冲区，单位：米0.2 /0.10 /0.15
+        self.declare_parameter('obstacle_buffer', 0.15) #0.20
+        self.declare_parameter('unknown_buffer', 0.08) #0.10
+        self.declare_parameter('map_border_buffer', 0.08) #0.15
 
         # 过滤太短的安全自由段，避免在墙角生成零碎点
-        self.declare_parameter('min_run_length', 0.30) #原始0.30
+        self.declare_parameter('min_run_length', 0.30)
 
-        # RCG pruning-lite 参数
-        # endpoint 模式：相邻 lap 之间主要只连接左右端点，减少中间乱换行
-        self.declare_parameter('enable_pruning_lite', True)
-
-        # 相邻 lap 端点连不上时，是否允许少量斜边桥接，避免图断开
-        self.declare_parameter('enable_diagonal_bridge', True)
-
-        # 每一对相邻 lap 的每一对重叠 segment，最多补几条斜边
-        self.declare_parameter('max_diagonal_bridges_per_segment_pair', 1)
-
-        # 相邻 lap 之间如果横向偏移超过这个距离，就不连普通 interlap 边
-        self.declare_parameter('interlap_col_tolerance', 0.18)
-
-        # 是否删除没有任何边连接的孤立节点
-        self.declare_parameter('drop_isolated_nodes', True)
-
-        # RViz 可视化参数
         self.declare_parameter('node_size', 0.06)
         self.declare_parameter('edge_width', 0.02)
 
@@ -89,14 +71,6 @@ class CStarRCGNode(Node):
         self.map_border_buffer = float(self.get_parameter('map_border_buffer').value)
         self.min_run_length = float(self.get_parameter('min_run_length').value)
 
-        self.enable_pruning_lite = bool(self.get_parameter('enable_pruning_lite').value)
-        self.enable_diagonal_bridge = bool(self.get_parameter('enable_diagonal_bridge').value)
-        self.max_diagonal_bridges_per_segment_pair = int(
-            self.get_parameter('max_diagonal_bridges_per_segment_pair').value
-        )
-        self.interlap_col_tolerance = float(self.get_parameter('interlap_col_tolerance').value)
-        self.drop_isolated_nodes = bool(self.get_parameter('drop_isolated_nodes').value)
-
         self.node_size = float(self.get_parameter('node_size').value)
         self.edge_width = float(self.get_parameter('edge_width').value)
 
@@ -112,28 +86,16 @@ class CStarRCGNode(Node):
         self.safe_free_arr: Optional[np.ndarray] = None
 
         self.free_sub = self.create_subscription(
-            OccupancyGrid,
-            self.free_topic,
-            self.free_callback,
-            10
+            OccupancyGrid, self.free_topic, self.free_callback, 10
         )
         self.frontier_sub = self.create_subscription(
-            OccupancyGrid,
-            self.frontier_topic,
-            self.frontier_callback,
-            10
+            OccupancyGrid, self.frontier_topic, self.frontier_callback, 10
         )
         self.obstacle_sub = self.create_subscription(
-            OccupancyGrid,
-            self.obstacle_topic,
-            self.obstacle_callback,
-            10
+            OccupancyGrid, self.obstacle_topic, self.obstacle_callback, 10
         )
         self.unknown_sub = self.create_subscription(
-            OccupancyGrid,
-            self.unknown_topic,
-            self.unknown_callback,
-            10
+            OccupancyGrid, self.unknown_topic, self.unknown_callback, 10
         )
 
         self.marker_pub = self.create_publisher(MarkerArray, '/cstar/rcg_markers', 10)
@@ -147,21 +109,12 @@ class CStarRCGNode(Node):
         self.get_logger().info(f'obstacle_topic={self.obstacle_topic}')
         self.get_logger().info(f'unknown_topic={self.unknown_topic}')
         self.get_logger().info(
-            f'lap_spacing={self.lap_spacing:.2f}, '
-            f'sample_spacing={self.sample_spacing:.2f}, '
-            f'prune_stride={self.prune_stride}'
+            f'lap_spacing={self.lap_spacing:.2f}, sample_spacing={self.sample_spacing:.2f}'
         )
         self.get_logger().info(
             f'obstacle_buffer={self.obstacle_buffer:.2f}, '
             f'unknown_buffer={self.unknown_buffer:.2f}, '
             f'map_border_buffer={self.map_border_buffer:.2f}'
-        )
-        self.get_logger().info(
-            f'pruning_lite={self.enable_pruning_lite}, '
-            f'diagonal_bridge={self.enable_diagonal_bridge}, '
-            f'max_diagonal_bridges_per_segment_pair={self.max_diagonal_bridges_per_segment_pair}, '
-            f'interlap_col_tolerance={self.interlap_col_tolerance:.2f}, '
-            f'drop_isolated_nodes={self.drop_isolated_nodes}'
         )
 
     def free_callback(self, msg: OccupancyGrid) -> None:
@@ -195,7 +148,6 @@ class CStarRCGNode(Node):
     def on_timer(self) -> None:
         if self.free_msg is None or self.frontier_msg is None:
             return
-
         if self.free_arr is None or self.frontier_arr is None:
             return
 
@@ -216,28 +168,21 @@ class CStarRCGNode(Node):
         base = self.free_msg.info
 
         msgs = [self.frontier_msg]
-
         if self.obstacle_msg is not None:
             msgs.append(self.obstacle_msg)
-
         if self.unknown_msg is not None:
             msgs.append(self.unknown_msg)
 
         for msg in msgs:
             info = msg.info
-
             if info.width != base.width:
                 return False
-
             if info.height != base.height:
                 return False
-
             if abs(info.resolution - base.resolution) > 1e-9:
                 return False
-
             if abs(info.origin.position.x - base.origin.position.x) > 1e-6:
                 return False
-
             if abs(info.origin.position.y - base.origin.position.y) > 1e-6:
                 return False
 
@@ -259,12 +204,13 @@ class CStarRCGNode(Node):
 
         free = self.free_arr.copy()
 
-        if self.obstacle_arr is not None and self.obstacle_arr.shape == free.shape:
+        # 如果 obstacle_map / unknown_map 暂时没来，就退化为“非 free 都是不安全区”
+        if self.obstacle_arr is not None:
             obstacle = self.obstacle_arr.copy()
         else:
             obstacle = np.logical_not(free)
 
-        if self.unknown_arr is not None and self.unknown_arr.shape == free.shape:
+        if self.unknown_arr is not None:
             unknown = self.unknown_arr.copy()
         else:
             unknown = np.zeros_like(free, dtype=bool)
@@ -296,13 +242,11 @@ class CStarRCGNode(Node):
         out = np.zeros_like(mask, dtype=bool)
 
         ys, xs = np.where(mask)
-
         if len(xs) == 0:
             return out
 
         offsets: List[Tuple[int, int]] = []
         r2 = radius_cells * radius_cells
-
         for dy in range(-radius_cells, radius_cells + 1):
             for dx in range(-radius_cells, radius_cells + 1):
                 if dx * dx + dy * dy <= r2:
@@ -317,28 +261,22 @@ class CStarRCGNode(Node):
         return out
 
     def build_graph(self) -> Tuple[List[GraphNode], Set[Tuple[int, int]]]:
-        assert self.free_msg is not None
-
         info = self.free_msg.info
         res = info.resolution
 
         lap_step = max(1, int(round(self.lap_spacing / res)))
         sample_step = max(1, int(round(self.sample_spacing / res)))
         frontier_rad = max(1, int(round(self.frontier_keep_radius / res)))
-
         interlap_max_cells = max(1.0, self.interlap_max_dist / res)
-        interlap_col_tol_cells = max(1.0, self.interlap_col_tolerance / res)
 
         nodes: List[GraphNode] = []
         edges: Set[Tuple[int, int]] = set()
 
         lap_to_nodes: Dict[int, List[GraphNode]] = {}
-        lap_seg_to_nodes: Dict[Tuple[int, int], List[GraphNode]] = {}
 
-        # 不再用全局 row_start，而是根据 safe_free_arr 的安全行带生成 lap
+        # 核心修改：不再用全局 row_start，而是根据 safe_free_arr 的安全行带生成 lap
         lap_rows = self.collect_lap_rows_from_safe_mask(lap_step)
 
-        # 1. 生成每条 lap 上的节点，并连接同一 lap 内相邻节点
         for lap_id, row in enumerate(lap_rows):
             runs = self.find_safe_runs_on_row(row)
             lap_nodes: List[GraphNode] = []
@@ -354,14 +292,16 @@ class CStarRCGNode(Node):
                     near_frontier = self.has_frontier_near(row, col, frontier_rad)
                     endpoint = (i == 0 or i == len(sample_cols) - 1)
 
-                    # pruning-lite：端点和 frontier 附近保留，其余按 stride 稀疏保留
+                    # 第一版弱 pruning：
+                    # 1. 保留安全段端点；
+                    # 2. 保留靠近 frontier 的点；
+                    # 3. 普通区域按 prune_stride 稀疏保留。
                     keep = endpoint or near_frontier or (i % self.prune_stride == 0)
 
                     if not keep:
                         continue
 
                     x, y = self.cell_to_world(col, row)
-
                     node = GraphNode(
                         idx=len(nodes),
                         row=row,
@@ -372,65 +312,18 @@ class CStarRCGNode(Node):
                         seg_id=seg_id,
                         essential=(endpoint or near_frontier)
                     )
-
                     nodes.append(node)
                     kept_nodes.append(node)
                     lap_nodes.append(node)
 
-                # 同一 lap 内只连相邻节点，这是牛耕覆盖的主路径
+                # 同一条 lap 内相邻节点连边
                 for a, b in zip(kept_nodes[:-1], kept_nodes[1:]):
                     if self.line_is_safe(a.row, a.col, b.row, b.col):
                         edges.add((min(a.idx, b.idx), max(a.idx, b.idx)))
 
-                if kept_nodes:
-                    lap_seg_to_nodes[(lap_id, seg_id)] = kept_nodes
-
             lap_to_nodes[lap_id] = lap_nodes
 
-        # 2. 相邻 lap 之间连边
-        if self.enable_pruning_lite:
-            self.add_pruned_interlap_edges(
-                lap_rows,
-                lap_to_nodes,
-                lap_seg_to_nodes,
-                edges,
-                interlap_max_cells,
-                interlap_col_tol_cells
-            )
-        else:
-            self.add_original_interlap_edges(
-                lap_rows,
-                lap_to_nodes,
-                edges,
-                interlap_max_cells
-            )
-
-        if self.drop_isolated_nodes:
-            nodes, edges = self.drop_isolated_and_reindex(nodes, edges)
-
-        self.get_logger().info(
-            f'RCG rebuilt: nodes={len(nodes)}, edges={len(edges)}, laps={len(lap_rows)}'
-        )
-
-        return nodes, edges
-
-    def add_pruned_interlap_edges(
-        self,
-        lap_rows: List[int],
-        lap_to_nodes: Dict[int, List[GraphNode]],
-        lap_seg_to_nodes: Dict[Tuple[int, int], List[GraphNode]],
-        edges: Set[Tuple[int, int]],
-        interlap_max_cells: float,
-        interlap_col_tol_cells: float
-    ) -> None:
-        """
-        pruning-lite 版本的相邻 lap 连边。
-
-        思路：
-        1. 相邻 lap 之间主要连接左右端点；
-        2. 如果端点连不上，再允许少量 diagonal bridge；
-        3. 避免中间区域出现大量乱七八糟的跨行边。
-        """
+        # 邻接 lap 之间连边
         for lap_id in range(len(lap_rows) - 1):
             curr_nodes = lap_to_nodes.get(lap_id, [])
             next_nodes = lap_to_nodes.get(lap_id + 1, [])
@@ -440,74 +333,7 @@ class CStarRCGNode(Node):
 
             row_gap = abs(lap_rows[lap_id + 1] - lap_rows[lap_id])
 
-            if row_gap > interlap_max_cells:
-                continue
-
-            curr_seg_ids = sorted({n.seg_id for n in curr_nodes})
-            next_seg_ids = sorted({n.seg_id for n in next_nodes})
-
-            for curr_seg_id in curr_seg_ids:
-                curr_seg_nodes = lap_seg_to_nodes.get((lap_id, curr_seg_id), [])
-
-                if not curr_seg_nodes:
-                    continue
-
-                for next_seg_id in next_seg_ids:
-                    next_seg_nodes = lap_seg_to_nodes.get((lap_id + 1, next_seg_id), [])
-
-                    if not next_seg_nodes:
-                        continue
-
-                    if not self.segments_are_close_enough(
-                        curr_seg_nodes,
-                        next_seg_nodes,
-                        interlap_max_cells
-                    ):
-                        continue
-
-                    added = self.add_endpoint_interlap_edges(
-                        curr_seg_nodes,
-                        next_seg_nodes,
-                        edges,
-                        interlap_max_cells,
-                        interlap_col_tol_cells
-                    )
-
-                    # 端点完全连不上时，才补少量 diagonal bridge，防止图断开
-                    if (
-                        added == 0 and
-                        self.enable_diagonal_bridge and
-                        self.max_diagonal_bridges_per_segment_pair > 0
-                    ):
-                        self.add_diagonal_bridge_edges(
-                            curr_seg_nodes,
-                            next_seg_nodes,
-                            edges,
-                            interlap_max_cells,
-                            self.max_diagonal_bridges_per_segment_pair
-                        )
-
-    def add_original_interlap_edges(
-        self,
-        lap_rows: List[int],
-        lap_to_nodes: Dict[int, List[GraphNode]],
-        edges: Set[Tuple[int, int]],
-        interlap_max_cells: float
-    ) -> None:
-        """
-        原始较密的相邻 lap 连边逻辑。
-
-        默认不会使用，只保留作为调试兜底。
-        """
-        for lap_id in range(len(lap_rows) - 1):
-            curr_nodes = lap_to_nodes.get(lap_id, [])
-            next_nodes = lap_to_nodes.get(lap_id + 1, [])
-
-            if not curr_nodes or not next_nodes:
-                continue
-
-            row_gap = abs(lap_rows[lap_id + 1] - lap_rows[lap_id])
-
+            # 如果两条 lap 行间距明显大于 interlap 阈值，直接跳过，避免跨区域尝试连边
             if row_gap > interlap_max_cells:
                 continue
 
@@ -530,217 +356,10 @@ class CStarRCGNode(Node):
                 if best_node is not None:
                     edges.add((min(n1.idx, best_node.idx), max(n1.idx, best_node.idx)))
 
-    def segments_are_close_enough(
-        self,
-        a_nodes: List[GraphNode],
-        b_nodes: List[GraphNode],
-        max_dist_cells: float
-    ) -> bool:
-        if not a_nodes or not b_nodes:
-            return False
-
-        a_min = min(n.col for n in a_nodes)
-        a_max = max(n.col for n in a_nodes)
-        b_min = min(n.col for n in b_nodes)
-        b_max = max(n.col for n in b_nodes)
-
-        # 两个横向 segment 有重叠，值得尝试连接
-        if max(a_min, b_min) <= min(a_max, b_max):
-            return True
-
-        # 没有重叠，但间隙不大，也允许尝试
-        gap = max(b_min - a_max, a_min - b_max)
-
-        return gap <= max_dist_cells
-
-    def try_add_edge(
-        self,
-        a: GraphNode,
-        b: GraphNode,
-        edges: Set[Tuple[int, int]],
-        max_dist_cells: float,
-        max_col_offset_cells: Optional[float] = None
-    ) -> bool:
-        drow = float(b.row - a.row)
-        dcol = float(b.col - a.col)
-        dist = math.hypot(drow, dcol)
-
-        if dist > max_dist_cells:
-            return False
-
-        if max_col_offset_cells is not None:
-            if abs(dcol) > max_col_offset_cells:
-                return False
-
-        if not self.line_is_safe(a.row, a.col, b.row, b.col):
-            return False
-
-        edges.add((min(a.idx, b.idx), max(a.idx, b.idx)))
-        return True
-
-    def add_endpoint_interlap_edges(
-        self,
-        curr_nodes: List[GraphNode],
-        next_nodes: List[GraphNode],
-        edges: Set[Tuple[int, int]],
-        max_dist_cells: float,
-        max_col_offset_cells: float
-    ) -> int:
-        """
-        pruning-lite 核心：
-        相邻 lap 之间优先只连接左右端点。
-
-        这样可以减少中间区域随意换行，使轨迹更接近 Boustrophedon。
-        """
-        if not curr_nodes or not next_nodes:
-            return 0
-
-        curr_sorted = sorted(curr_nodes, key=lambda n: n.col)
-        next_sorted = sorted(next_nodes, key=lambda n: n.col)
-
-        curr_left = curr_sorted[0]
-        curr_right = curr_sorted[-1]
-        next_left = next_sorted[0]
-        next_right = next_sorted[-1]
-
-        added = 0
-
-        # 左端点连左端点
-        if self.try_add_edge(
-            curr_left,
-            next_left,
-            edges,
-            max_dist_cells,
-            max_col_offset_cells
-        ):
-            added += 1
-
-        # 右端点连右端点
-        if curr_right.idx != curr_left.idx or next_right.idx != next_left.idx:
-            if self.try_add_edge(
-                curr_right,
-                next_right,
-                edges,
-                max_dist_cells,
-                max_col_offset_cells
-            ):
-                added += 1
-
-        return added
-
-    def add_diagonal_bridge_edges(
-        self,
-        curr_nodes: List[GraphNode],
-        next_nodes: List[GraphNode],
-        edges: Set[Tuple[int, int]],
-        max_dist_cells: float,
-        max_edges: int
-    ) -> int:
-        """
-        如果端点 interlap 边完全连不上，才允许少量斜向 bridge。
-
-        这不是 normal coverage 的主要边，
-        只是为了避免 RCG 被 obstacle / unknown 切成不连通碎片。
-        """
-        candidates: List[Tuple[float, GraphNode, GraphNode]] = []
-
-        for a in curr_nodes:
-            for b in next_nodes:
-                drow = float(b.row - a.row)
-                dcol = float(b.col - a.col)
-                dist = math.hypot(drow, dcol)
-
-                if dist > max_dist_cells:
-                    continue
-
-                if not self.line_is_safe(a.row, a.col, b.row, b.col):
-                    continue
-
-                candidates.append((dist, a, b))
-
-        candidates.sort(key=lambda item: item[0])
-
-        added = 0
-
-        for _, a, b in candidates:
-            edge = (min(a.idx, b.idx), max(a.idx, b.idx))
-
-            if edge in edges:
-                continue
-
-            edges.add(edge)
-            added += 1
-
-            if added >= max_edges:
-                break
-
-        return added
-
-    def drop_isolated_and_reindex(
-        self,
-        nodes: List[GraphNode],
-        edges: Set[Tuple[int, int]]
-    ) -> Tuple[List[GraphNode], Set[Tuple[int, int]]]:
-        """
-        删除没有任何边连接的孤立节点，并重新编号。
-
-        这样可以避免 planner 看到一些到不了的孤立采样点。
-        """
-        if not nodes:
-            return nodes, edges
-
-        degree: Dict[int, int] = {n.idx: 0 for n in nodes}
-
-        for i, j in edges:
-            degree[i] = degree.get(i, 0) + 1
-            degree[j] = degree.get(j, 0) + 1
-
-        keep_old_ids = {
-            idx for idx, deg in degree.items()
-            if deg > 0
-        }
-
-        if len(keep_old_ids) == len(nodes):
-            return nodes, edges
-
-        old_to_new: Dict[int, int] = {}
-        new_nodes: List[GraphNode] = []
-
-        for old_node in nodes:
-            if old_node.idx not in keep_old_ids:
-                continue
-
-            new_idx = len(new_nodes)
-            old_to_new[old_node.idx] = new_idx
-
-            new_nodes.append(
-                GraphNode(
-                    idx=new_idx,
-                    row=old_node.row,
-                    col=old_node.col,
-                    x=old_node.x,
-                    y=old_node.y,
-                    lap_id=old_node.lap_id,
-                    seg_id=old_node.seg_id,
-                    essential=old_node.essential
-                )
-            )
-
-        new_edges: Set[Tuple[int, int]] = set()
-
-        for i, j in edges:
-            if i not in old_to_new or j not in old_to_new:
-                continue
-
-            ni = old_to_new[i]
-            nj = old_to_new[j]
-
-            if ni == nj:
-                continue
-
-            new_edges.add((min(ni, nj), max(ni, nj)))
-
-        return new_nodes, new_edges
+        self.get_logger().info(
+            f'RCG rebuilt: nodes={len(nodes)}, edges={len(edges)}, laps={len(lap_rows)}'
+        )
+        return nodes, edges
 
     def find_safe_runs_on_row(self, row: int) -> List[Tuple[int, int]]:
         runs: List[Tuple[int, int]] = []
@@ -748,11 +367,8 @@ class CStarRCGNode(Node):
         start = 0
 
         arr = self.safe_free_arr
-
         if arr is None:
             return runs
-
-        assert self.free_msg is not None
 
         min_cells = max(1, int(round(self.min_run_length / self.free_msg.info.resolution)))
 
@@ -763,13 +379,11 @@ class CStarRCGNode(Node):
             elif not arr[row, c] and inside:
                 inside = False
                 end = c - 1
-
                 if end >= start and (end - start + 1) >= min_cells:
                     runs.append((start, end))
 
         if inside:
             end = arr.shape[1] - 1
-
             if end >= start and (end - start + 1) >= min_cells:
                 runs.append((start, end))
 
@@ -780,33 +394,25 @@ class CStarRCGNode(Node):
             return [start_col]
 
         cols = list(range(start_col, end_col + 1, step))
-
         if cols[-1] != end_col:
             cols.append(end_col)
 
         return sorted(set(cols))
 
     def has_frontier_near(self, row: int, col: int, rad: int) -> bool:
-        if self.frontier_arr is None:
-            return False
-
         r0 = max(0, row - rad)
         r1 = min(self.frontier_arr.shape[0], row + rad + 1)
         c0 = max(0, col - rad)
         c1 = min(self.frontier_arr.shape[1], col + rad + 1)
-
         return bool(np.any(self.frontier_arr[r0:r1, c0:c1]))
 
     def is_safe_cell(self, row: int, col: int) -> bool:
         if self.safe_free_arr is None:
             return False
-
         if row < 0 or row >= self.safe_free_arr.shape[0]:
             return False
-
         if col < 0 or col >= self.safe_free_arr.shape[1]:
             return False
-
         return bool(self.safe_free_arr[row, col])
 
     def line_is_safe(self, r0: int, c0: int, r1: int, c1: int) -> bool:
@@ -826,12 +432,9 @@ class CStarRCGNode(Node):
         return True
 
     def cell_to_world(self, col: int, row: int) -> Tuple[float, float]:
-        assert self.free_msg is not None
-
         info = self.free_msg.info
         x = info.origin.position.x + (col + 0.5) * info.resolution
         y = info.origin.position.y + (row + 0.5) * info.resolution
-
         return x, y
 
     def publish_pose_array(self, nodes: List[GraphNode]) -> None:
@@ -916,9 +519,6 @@ class CStarRCGNode(Node):
                 normal_nodes.points.append(pt)
 
         for i, j in sorted(edges):
-            if i < 0 or j < 0 or i >= len(nodes) or j >= len(nodes):
-                continue
-
             ni = nodes[i]
             nj = nodes[j]
 
@@ -969,13 +569,11 @@ class CStarRCGNode(Node):
             elif not row_has_safe[r] and inside:
                 inside = False
                 end = r - 1
-
                 if end >= start:
                     bands.append((start, end))
 
         if inside:
             end = h - 1
-
             if end >= start:
                 bands.append((start, end))
 
@@ -984,27 +582,25 @@ class CStarRCGNode(Node):
         for start, end in bands:
             band_height = end - start + 1
 
-            # 很窄的安全带，至少取中间一行
+            # 很窄的安全带，至少取中间一行，避免上下边界两行太挤
             if band_height <= max(2, lap_step // 2):
                 rows.add((start + end) // 2)
                 continue
 
+            # 从该安全行带自己的上边界开始采样
             r = start
-
             while r <= end:
                 rows.add(r)
                 r += lap_step
 
-            # 保留下边界附近一行，保证上下边界覆盖一致
+            # 强制保留下边界附近一行，保证上下边界覆盖一致
             rows.add(end)
 
         return sorted(rows)
 
-
 def main(args=None) -> None:
     rclpy.init(args=args)
     node = CStarRCGNode()
-
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

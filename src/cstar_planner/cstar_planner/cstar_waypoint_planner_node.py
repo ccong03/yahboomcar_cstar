@@ -45,9 +45,8 @@ class CStarWaypointPlannerNode(Node):
         self.declare_parameter('reached_distance', 0.18)
 
         # 新逻辑：必须等 base_footprint 底盘中心靠近 goal_marker 中心后才更新 goal。
-        # 普通绿色 goal 建议 0.07~0.09；橙色 retreat node 建议 0.08~0.10。
-        self.declare_parameter('goal_center_tolerance', 0.10) #原始0.08
-        self.declare_parameter('retreat_center_tolerance', 0.10) #原始0.09
+        self.declare_parameter('goal_center_tolerance', 0.10)  # 原始0.08
+        self.declare_parameter('retreat_center_tolerance', 0.10)  # 原始0.09
 
         # 这里不要太大。太大会把附近 open 采样点提前染成 closed。
         self.declare_parameter('closed_position_radius', 0.12)
@@ -61,7 +60,6 @@ class CStarWaypointPlannerNode(Node):
         self.declare_parameter('same_col_x_tolerance', 0.16)
 
         # 如果严格横向/纵向邻居都没有，是否允许用斜边兜底，避免误判 dead-end。
-        # 想让路径更规整，可以启动时改成 false。
         self.declare_parameter('allow_diagonal_fallback', True)
 
         # retreat node 判定
@@ -76,6 +74,38 @@ class CStarWaypointPlannerNode(Node):
 
         # A* path 重采样距离。越小，escape_path 越密，controller 越好跟。
         self.declare_parameter('escape_resample_step', 0.08)
+
+        # ============================================================
+        # RCG 图层 hole detection，只做检测和可视化，不影响当前 C* 运行。
+        # ============================================================
+        self.declare_parameter('enable_graph_hole_detection', True)
+
+        # 太小的 open component 不认为是 hole，避免地图锯齿和边角噪声。
+        self.declare_parameter('hole_min_nodes', 4)
+
+        # 太大的 open component 先不认为是局部 hole，避免把未探索大区域误报。
+        self.declare_parameter('hole_max_nodes', 120)
+
+        # 用 component 外接矩形面积做过滤，单位 m^2。
+        self.declare_parameter('hole_min_bbox_area', 0.10)
+        self.declare_parameter('hole_max_bbox_area', 6.00)
+
+        # 距离机器人太远的 open component 暂时不报。
+        # 这不是旧版那种栅格局部 floodfill，而是只限制“图层 hole 候选”不要太远。
+        self.declare_parameter('hole_max_robot_distance', 2.20)
+
+        # 如果 open component 靠近 unknown，则说明更像 frontier，不判定为 hole。
+        self.declare_parameter('hole_unknown_reject_radius', 0.25)
+
+        # hole 必须贴近已覆盖轨迹或者与 closed 节点相邻，体现“被绕过去的未覆盖区”。
+        self.declare_parameter('hole_closed_attach_radius', 0.30)
+        self.declare_parameter('hole_min_closed_attach_nodes', 1)
+
+        # 当前正在前往的 normal goal 所在的 open component 不判定为 hole。
+        self.declare_parameter('hole_ignore_current_goal_component', True)
+
+        # escape 过程中先不做 hole 检测，避免 retreat 阶段可视化干扰判断。
+        self.declare_parameter('hole_disable_during_escape', True)
 
         self.rcg_nodes_topic = self.get_parameter('rcg_nodes_topic').value
         self.rcg_markers_topic = self.get_parameter('rcg_markers_topic').value
@@ -117,6 +147,30 @@ class CStarWaypointPlannerNode(Node):
         self.nearest_safe_search_radius = float(self.get_parameter('nearest_safe_search_radius').value)
         self.escape_resample_step = float(self.get_parameter('escape_resample_step').value)
 
+        self.enable_graph_hole_detection = bool(
+            self.get_parameter('enable_graph_hole_detection').value
+        )
+        self.hole_min_nodes = int(self.get_parameter('hole_min_nodes').value)
+        self.hole_max_nodes = int(self.get_parameter('hole_max_nodes').value)
+        self.hole_min_bbox_area = float(self.get_parameter('hole_min_bbox_area').value)
+        self.hole_max_bbox_area = float(self.get_parameter('hole_max_bbox_area').value)
+        self.hole_max_robot_distance = float(self.get_parameter('hole_max_robot_distance').value)
+        self.hole_unknown_reject_radius = float(
+            self.get_parameter('hole_unknown_reject_radius').value
+        )
+        self.hole_closed_attach_radius = float(
+            self.get_parameter('hole_closed_attach_radius').value
+        )
+        self.hole_min_closed_attach_nodes = int(
+            self.get_parameter('hole_min_closed_attach_nodes').value
+        )
+        self.hole_ignore_current_goal_component = bool(
+            self.get_parameter('hole_ignore_current_goal_component').value
+        )
+        self.hole_disable_during_escape = bool(
+            self.get_parameter('hole_disable_during_escape').value
+        )
+
         self.nodes: Dict[NodeKey, Tuple[float, float]] = {}
         self.raw_edges: List[Tuple[NodeKey, NodeKey]] = []
         self.adjacency: Dict[NodeKey, Set[NodeKey]] = {}
@@ -143,6 +197,8 @@ class CStarWaypointPlannerNode(Node):
         self.obstacle_arr: Optional[np.ndarray] = None
         self.unknown_arr: Optional[np.ndarray] = None
 
+        self.latest_graph_holes: List[Tuple[Set[NodeKey], float, float, float, int]] = []
+
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
@@ -161,6 +217,23 @@ class CStarWaypointPlannerNode(Node):
         self.escape_path_pub = self.create_publisher(Path, '/cstar/escape_path', 10)
         self.retreat_marker_pub = self.create_publisher(Marker, '/cstar/retreat_nodes', 10)
 
+        # 图层 hole 检测输出，仅用于可视化。
+        self.graph_hole_marker_pub = self.create_publisher(
+            MarkerArray,
+            '/cstar/graph_hole_markers',
+            10
+        )
+        self.graph_hole_nodes_pub = self.create_publisher(
+            PoseArray,
+            '/cstar/graph_hole_nodes',
+            10
+        )
+        self.graph_hole_centers_pub = self.create_publisher(
+            PoseArray,
+            '/cstar/graph_hole_centers',
+            10
+        )
+
         self.timer = self.create_timer(self.update_period, self.on_timer)
 
         self.get_logger().info('CStarWaypointPlannerNode started.')
@@ -177,6 +250,11 @@ class CStarWaypointPlannerNode(Node):
         self.get_logger().info(
             f'goal_center_tolerance={self.goal_center_tolerance:.2f}, '
             f'retreat_center_tolerance={self.retreat_center_tolerance:.2f}'
+        )
+        self.get_logger().info(
+            f'graph_hole_detection={self.enable_graph_hole_detection}, '
+            f'hole_min_nodes={self.hole_min_nodes}, '
+            f'hole_max_robot_distance={self.hole_max_robot_distance:.2f}'
         )
 
     def make_key(self, x: float, y: float) -> NodeKey:
@@ -417,9 +495,16 @@ class CStarWaypointPlannerNode(Node):
         return math.hypot(robot_xy[0] - gx, robot_xy[1] - gy) <= tolerance
 
     def classify_open_neighbors(self, current_key: NodeKey) -> Dict[str, List[Tuple[float, NodeKey]]]:
+        """
+        将 current_key 的 open 邻接节点按几何方向分类。
+
+        这里的分类只用于 normal coverage。
+        normal coverage 阶段应该尽量避免 diagonal，
+        否则轨迹会变成斜来斜去，不像 Boustrophedon。
+        """
         result = {
-            'forward': [],
-            'backward': [],
+            'left': [],
+            'right': [],
             'up': [],
             'down': [],
             'diagonal': [],
@@ -445,15 +530,15 @@ class CStarWaypointPlannerNode(Node):
             if dist < 1e-6:
                 continue
 
-            # 同一 lap 上的横向运动，是 Boustrophedon 的主运动。
+            # 同一条 lap 上的横向运动：这是牛耕覆盖的主运动
             if abs(dy) <= self.same_lap_y_tolerance:
-                if dx * self.sweep_dir > 0.0:
-                    result['forward'].append((abs(dx), nb))
+                if dx < 0:
+                    result['left'].append((abs(dx), nb))
                 else:
-                    result['backward'].append((abs(dx), nb))
+                    result['right'].append((abs(dx), nb))
                 continue
 
-            # 换行运动。只有横向走不动时才优先考虑。
+            # 相邻 lap 之间的换行动作
             if abs(dx) <= self.same_col_x_tolerance:
                 if dy > 0:
                     result['up'].append((abs(dy), nb))
@@ -461,6 +546,7 @@ class CStarWaypointPlannerNode(Node):
                     result['down'].append((abs(dy), nb))
                 continue
 
+            # 斜边只作为最后兜底，不作为 normal coverage 主逻辑
             result['diagonal'].append((dist, nb))
 
         for k in result:
@@ -507,27 +593,41 @@ class CStarWaypointPlannerNode(Node):
         return candidates[0][2]
 
     def choose_next_normal_goal(self, current_key: NodeKey) -> Optional[NodeKey]:
+        """
+        改进后的 normal C* waypoint 选择。
+
+        目标：
+        1. 优先把当前 lap 的横向节点扫完；
+        2. 当前 lap 没有横向 open 节点后，再换到相邻 lap；
+        3. normal coverage 阶段尽量不走 diagonal；
+        4. 只有在显式允许 diagonal fallback 时，才用斜边兜底。
+
+        这样比原来的 sweep_dir 贪心更稳定，
+        在小房间内更容易形成 back-and-forth coverage。
+        """
         candidates = self.classify_open_neighbors(current_key)
 
-        # 1. 优先沿当前 lap 继续扫
-        if candidates['forward']:
-            return candidates['forward'][0][1]
+        # 1. 当前 lap 上优先向左扫。
+        # 如果左边还有 open 节点，先不要急着换行或者 retreat。
+        if candidates['left']:
+            self.sweep_dir = -1.0
+            return candidates['left'][0][1]
 
-        # 2. 当前 lap 走到头，尝试上下换行，并反转 sweep 方向
+        # 2. 左边没有 open 后，再扫右边。
+        # 这样可以尽量把当前 lap 内的节点先清干净。
+        if candidates['right']:
+            self.sweep_dir = 1.0
+            return candidates['right'][0][1]
+
+        # 3. 当前 lap 横向没有 open 节点后，再尝试换行。
         if candidates['up']:
-            self.sweep_dir *= -1.0
             return candidates['up'][0][1]
 
         if candidates['down']:
-            self.sweep_dir *= -1.0
             return candidates['down'][0][1]
 
-        # 3. 上下都不行时，再尝试回头补扫
-        if candidates['backward']:
-            self.sweep_dir *= -1.0
-            return candidates['backward'][0][1]
-
-        # 4. 最后才允许斜边兜底，避免明明有 open 邻居却误判 dead-end
+        # 4. normal coverage 阶段默认不建议走 diagonal。
+        # 如果你启动时 allow_diagonal_fallback:=true，则允许最后兜底。
         if self.allow_diagonal_fallback and candidates['diagonal']:
             return self.choose_diagonal_fallback(current_key)
 
@@ -890,8 +990,6 @@ class CStarWaypointPlannerNode(Node):
             simplified = self.simplify_grid_path(grid_path, safe)
             xy_path = [self.cell_to_world(cell) for cell in simplified]
 
-            # 把真正的 retreat_node 坐标追加到 escape path 末尾，
-            # 避免 A* 最后一个 safe cell 和黄色 retreat_node 不重合。
             if target_key in self.nodes:
                 tx, ty = self.nodes[target_key]
                 if not xy_path or math.hypot(xy_path[-1][0] - tx, xy_path[-1][1] - ty) > 0.03:
@@ -944,6 +1042,384 @@ class CStarWaypointPlannerNode(Node):
             return target_key, xy_path, True
 
         return None, [], False
+
+    # ============================================================
+    # RCG 图层 hole detection：只检测和可视化，不改变当前 C* 目标。
+    # ============================================================
+
+    def open_node_components(self) -> List[Set[NodeKey]]:
+        open_nodes: Set[NodeKey] = set()
+
+        for key in self.nodes.keys():
+            if not self.is_closed_key(key):
+                open_nodes.add(key)
+
+        visited: Set[NodeKey] = set()
+        components: List[Set[NodeKey]] = []
+
+        for start in open_nodes:
+            if start in visited:
+                continue
+
+            comp: Set[NodeKey] = set()
+            stack = [start]
+            visited.add(start)
+
+            while stack:
+                key = stack.pop()
+                comp.add(key)
+
+                for nb in self.adjacency.get(key, set()):
+                    if nb not in open_nodes:
+                        continue
+
+                    if nb in visited:
+                        continue
+
+                    visited.add(nb)
+                    stack.append(nb)
+
+            components.append(comp)
+
+        return components
+
+    def component_contains_key(self, comp: Set[NodeKey], key: Optional[NodeKey]) -> bool:
+        if key is None:
+            return False
+        return key in comp
+
+    def component_centroid_xy(self, comp: Set[NodeKey]) -> Tuple[float, float]:
+        if not comp:
+            return 0.0, 0.0
+
+        sx = 0.0
+        sy = 0.0
+        n = 0
+
+        for key in comp:
+            if key not in self.nodes:
+                continue
+
+            x, y = self.nodes[key]
+            sx += x
+            sy += y
+            n += 1
+
+        if n <= 0:
+            return 0.0, 0.0
+
+        return sx / float(n), sy / float(n)
+
+    def component_bbox_area(self, comp: Set[NodeKey]) -> float:
+        xs: List[float] = []
+        ys: List[float] = []
+
+        for key in comp:
+            if key not in self.nodes:
+                continue
+
+            x, y = self.nodes[key]
+            xs.append(x)
+            ys.append(y)
+
+        if not xs or not ys:
+            return 0.0
+
+        # 给外接框加一点厚度，避免一排节点面积被算成 0。
+        pad = max(0.05, self.position_quantization)
+
+        width = max(xs) - min(xs) + pad
+        height = max(ys) - min(ys) + pad
+
+        return max(0.0, width * height)
+
+    def component_min_distance_to_robot(
+        self,
+        comp: Set[NodeKey],
+        robot_xy: Tuple[float, float]
+    ) -> float:
+        rx, ry = robot_xy
+        best = float('inf')
+
+        for key in comp:
+            if key not in self.nodes:
+                continue
+
+            x, y = self.nodes[key]
+            d = math.hypot(x - rx, y - ry)
+
+            if d < best:
+                best = d
+
+        return best
+
+    def node_near_unknown(self, key: NodeKey, radius: float) -> bool:
+        if self.unknown_arr is None or self.free_msg is None:
+            return False
+
+        if key not in self.nodes:
+            return False
+
+        x, y = self.nodes[key]
+        cell = self.world_to_cell(x, y)
+
+        if cell is None:
+            return False
+
+        row, col = cell
+        h, w = self.unknown_arr.shape
+        res = self.free_msg.info.resolution
+        rad = max(1, int(math.ceil(radius / res)))
+
+        r0 = max(0, row - rad)
+        r1 = min(h, row + rad + 1)
+        c0 = max(0, col - rad)
+        c1 = min(w, col + rad + 1)
+
+        return bool(np.any(self.unknown_arr[r0:r1, c0:c1]))
+
+    def component_near_unknown(self, comp: Set[NodeKey]) -> bool:
+        for key in comp:
+            if self.node_near_unknown(key, self.hole_unknown_reject_radius):
+                return True
+        return False
+
+    def component_closed_attach_count(self, comp: Set[NodeKey]) -> int:
+        count = 0
+
+        for key in comp:
+            if key not in self.nodes:
+                continue
+
+            attached = False
+
+            # 条件 1：这个 open 节点和 closed 节点在 RCG 上相邻。
+            for nb in self.adjacency.get(key, set()):
+                if nb in self.nodes and self.is_closed_key(nb):
+                    attached = True
+                    break
+
+            # 条件 2：这个 open 节点靠近已走轨迹。
+            if not attached:
+                x, y = self.nodes[key]
+                if self.is_near_closed_position(
+                    x,
+                    y,
+                    radius=self.hole_closed_attach_radius
+                ):
+                    attached = True
+
+            if attached:
+                count += 1
+
+        return count
+
+    def detect_graph_holes(
+        self,
+        current_key: Optional[NodeKey],
+        protected_goal_key: Optional[NodeKey],
+        robot_xy: Tuple[float, float]
+    ) -> List[Tuple[Set[NodeKey], float, float, float, int]]:
+        """
+        基于 RCG Open 子图做 hole detection。
+
+        返回：
+        [
+            (component_keys, centroid_x, centroid_y, bbox_area, attach_count),
+            ...
+        ]
+
+        这一步只检测和发布可视化，不会修改 current_goal_key，
+        不会影响当前 C* normal / escape 逻辑。
+        """
+        if not self.enable_graph_hole_detection:
+            return []
+
+        if self.hole_disable_during_escape and self.escape_active:
+            return []
+
+        if not self.nodes or not self.adjacency:
+            return []
+
+        components = self.open_node_components()
+        holes: List[Tuple[Set[NodeKey], float, float, float, int]] = []
+
+        for comp in components:
+            node_count = len(comp)
+
+            if node_count < self.hole_min_nodes:
+                continue
+
+            if node_count > self.hole_max_nodes:
+                continue
+
+            # 当前 goal 所在连通分量，是 C* 正准备去扫的区域，不判定为 hole。
+            if (
+                self.hole_ignore_current_goal_component and
+                self.component_contains_key(comp, protected_goal_key)
+            ):
+                continue
+
+            # 当前机器人所在分量也不要判定为 hole。
+            if current_key is not None and current_key in comp:
+                continue
+
+            bbox_area = self.component_bbox_area(comp)
+
+            if bbox_area < self.hole_min_bbox_area:
+                continue
+
+            if bbox_area > self.hole_max_bbox_area:
+                continue
+
+            min_robot_dist = self.component_min_distance_to_robot(comp, robot_xy)
+
+            if min_robot_dist > self.hole_max_robot_distance:
+                continue
+
+            # 靠近 unknown 的 open component 更像 frontier，不是 coverage hole。
+            if self.component_near_unknown(comp):
+                continue
+
+            # 必须贴近 closed path / covered region，体现“已经绕过去但还没扫”的区域。
+            attach_count = self.component_closed_attach_count(comp)
+
+            if attach_count < self.hole_min_closed_attach_nodes:
+                continue
+
+            cx, cy = self.component_centroid_xy(comp)
+            holes.append((comp, cx, cy, bbox_area, attach_count))
+
+        return holes
+
+    def publish_graph_hole_outputs(
+        self,
+        holes: List[Tuple[Set[NodeKey], float, float, float, int]]
+    ) -> None:
+        self.latest_graph_holes = holes
+
+        now = self.get_clock().now().to_msg()
+
+        # 1. 发布 hole centers
+        centers = PoseArray()
+        centers.header.stamp = now
+        centers.header.frame_id = self.map_frame
+
+        # 2. 发布所有 hole nodes
+        hole_nodes = PoseArray()
+        hole_nodes.header.stamp = now
+        hole_nodes.header.frame_id = self.map_frame
+
+        # 3. 发布 MarkerArray
+        ma = MarkerArray()
+
+        delete_all = Marker()
+        delete_all.header.stamp = now
+        delete_all.header.frame_id = self.map_frame
+        delete_all.action = Marker.DELETEALL
+        ma.markers.append(delete_all)
+
+        node_marker = Marker()
+        node_marker.header.stamp = now
+        node_marker.header.frame_id = self.map_frame
+        node_marker.ns = 'graph_hole_nodes'
+        node_marker.id = 0
+        node_marker.type = Marker.POINTS
+        node_marker.action = Marker.ADD
+        node_marker.scale.x = 0.09
+        node_marker.scale.y = 0.09
+        node_marker.color.r = 1.0
+        node_marker.color.g = 0.0
+        node_marker.color.b = 1.0
+        node_marker.color.a = 0.90
+        node_marker.pose.orientation.w = 1.0
+
+        center_marker = Marker()
+        center_marker.header.stamp = now
+        center_marker.header.frame_id = self.map_frame
+        center_marker.ns = 'graph_hole_centers'
+        center_marker.id = 1
+        center_marker.type = Marker.SPHERE_LIST
+        center_marker.action = Marker.ADD
+        center_marker.scale.x = 0.18
+        center_marker.scale.y = 0.18
+        center_marker.scale.z = 0.18
+        center_marker.color.r = 1.0
+        center_marker.color.g = 0.0
+        center_marker.color.b = 1.0
+        center_marker.color.a = 0.95
+        center_marker.pose.orientation.w = 1.0
+
+        text_id = 100
+
+        for i, (comp, cx, cy, bbox_area, attach_count) in enumerate(holes):
+            center_pose = PoseStamped()
+            center_pose.header.stamp = now
+            center_pose.header.frame_id = self.map_frame
+            center_pose.pose.position.x = cx
+            center_pose.pose.position.y = cy
+            center_pose.pose.position.z = 0.12
+            center_pose.pose.orientation.w = 1.0
+            centers.poses.append(center_pose.pose)
+
+            cp = Point()
+            cp.x = cx
+            cp.y = cy
+            cp.z = 0.12
+            center_marker.points.append(cp)
+
+            for key in comp:
+                if key not in self.nodes:
+                    continue
+
+                x, y = self.nodes[key]
+
+                p = Point()
+                p.x = x
+                p.y = y
+                p.z = 0.11
+                node_marker.points.append(p)
+
+                pose = PoseStamped()
+                pose.header.stamp = now
+                pose.header.frame_id = self.map_frame
+                pose.pose.position.x = x
+                pose.pose.position.y = y
+                pose.pose.position.z = 0.11
+                pose.pose.orientation.w = 1.0
+                hole_nodes.poses.append(pose.pose)
+
+            text = Marker()
+            text.header.stamp = now
+            text.header.frame_id = self.map_frame
+            text.ns = 'graph_hole_labels'
+            text.id = text_id
+            text_id += 1
+            text.type = Marker.TEXT_VIEW_FACING
+            text.action = Marker.ADD
+            text.pose.position.x = cx
+            text.pose.position.y = cy
+            text.pose.position.z = 0.30
+            text.pose.orientation.w = 1.0
+            text.scale.z = 0.16
+            text.color.r = 1.0
+            text.color.g = 0.0
+            text.color.b = 1.0
+            text.color.a = 1.0
+            text.text = (
+                f'graph hole\n'
+                f'n={len(comp)}\n'
+                f'a={bbox_area:.2f}m2\n'
+                f'att={attach_count}'
+            )
+            ma.markers.append(text)
+
+        ma.markers.append(node_marker)
+        ma.markers.append(center_marker)
+
+        self.graph_hole_centers_pub.publish(centers)
+        self.graph_hole_nodes_pub.publish(hole_nodes)
+        self.graph_hole_marker_pub.publish(ma)
 
     def publish_goal(self, goal_key: NodeKey) -> None:
         if goal_key not in self.nodes:
@@ -1187,6 +1663,7 @@ class CStarWaypointPlannerNode(Node):
             self.publish_selected_path()
             self.publish_escape_path()
             self.publish_retreat_nodes()
+            self.publish_graph_hole_outputs([])
             return
 
         self.close_key(current_key)
@@ -1226,13 +1703,22 @@ class CStarWaypointPlannerNode(Node):
                             f'Robot will stop until map/RCG updates.'
                         )
 
+        # 发布当前 C* goal
         if self.current_goal_key is not None:
             self.publish_goal(self.current_goal_key)
+
+        # 只检测 hole，不影响当前 C* 运行
+        graph_holes = self.detect_graph_holes(
+            current_key=current_key,
+            protected_goal_key=self.current_goal_key,
+            robot_xy=robot_xy
+        )
 
         self.publish_open_closed_markers()
         self.publish_selected_path()
         self.publish_escape_path()
         self.publish_retreat_nodes()
+        self.publish_graph_hole_outputs(graph_holes)
 
 
 def main(args=None) -> None:

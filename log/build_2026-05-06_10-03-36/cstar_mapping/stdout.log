@@ -1,0 +1,17 @@
+running develop
+running egg_info
+writing cstar_mapping.egg-info/PKG-INFO
+writing dependency_links to cstar_mapping.egg-info/dependency_links.txt
+writing entry points to cstar_mapping.egg-info/entry_points.txt
+writing requirements to cstar_mapping.egg-info/requires.txt
+writing top-level names to cstar_mapping.egg-info/top_level.txt
+reading manifest file 'cstar_mapping.egg-info/SOURCES.txt'
+writing manifest file 'cstar_mapping.egg-info/SOURCES.txt'
+running build_ext
+Creating /home/admin/yahboomcar_cstar/install/cstar_mapping/lib/python3.10/site-packages/cstar-mapping.egg-link (link to .)
+Installing cstar_frontier_node script to /home/admin/yahboomcar_cstar/install/cstar_mapping/lib/cstar_mapping
+Installing cstar_hole_detector_node script to /home/admin/yahboomcar_cstar/install/cstar_mapping/lib/cstar_mapping
+Installing cstar_map_state_node script to /home/admin/yahboomcar_cstar/install/cstar_mapping/lib/cstar_mapping
+
+Installed /home/admin/yahboomcar_cstar/build/cstar_mapping
+running symlink_data

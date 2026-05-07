@@ -37,26 +37,34 @@ class CStarHoleDetectorNode(Node):
         # 小车至少累计走过这么远之后，才开始检测 hole
         self.declare_parameter('start_after_robot_moved_distance', 0.50)
 
-        # 只检测机器人附近的 hole，避免一启动就全图乱报
-        self.declare_parameter('local_detection_radius', 1.50)
+        # 只检测机器人附近的 hole
+        self.declare_parameter('local_detection_radius', 1.30)
 
-        # hole 面积过滤，单位 m^2
-        self.declare_parameter('min_hole_area', 0.05)
-        self.declare_parameter('max_hole_area', 4.00)
+        # 全局 hole 连通域面积过滤，单位 m^2
+        # 太小的未覆盖碎片直接过滤掉
+        self.declare_parameter('min_hole_area', 0.20)
+        self.declare_parameter('max_hole_area', 6.00)
+
+        # 关键新增：
+        # 一个 hole 连通域必须和机器人附近区域有足够大的重叠面积，
+        # 否则即使它在全图 candidate 里存在，也不认为它是“当前需要处理的 nearby hole”。
+        self.declare_parameter('min_local_overlap_area', 0.08)
 
         # unknown 附近不要判定为 hole，避免把 frontier 当成 hole
         self.declare_parameter('unknown_buffer', 0.15)
 
         # covered 轻微膨胀，用于封住 covered_map 里的小缝隙
-        # 如果门口明明被扫过但栅格有小洞，这个参数能提高 hole 检测稳定性
-        self.declare_parameter('covered_seal_buffer', 0.06)
+        self.declare_parameter('covered_seal_buffer', 0.10)
 
         # 边界封闭性要求。越大越严格。
-        # 这里默认不要太高，否则仿真地图锯齿多时容易漏检。
-        self.declare_parameter('min_enclosed_boundary_ratio', 0.35)
+        self.declare_parameter('min_enclosed_boundary_ratio', 0.30)
 
         # 要求 hole 边界附近至少有少量 covered 区域，否则可能只是未探索大区域
         self.declare_parameter('min_covered_boundary_cells', 3)
+
+        # false：/cstar/hole_map 只显示小车附近的 hole 重叠区域，避免远处整块区域被染出来
+        # true：/cstar/hole_map 显示完整 hole 连通域
+        self.declare_parameter('publish_full_hole_region', False)
 
         self.free_map_topic = self.get_parameter('free_map_topic').value
         self.covered_map_topic = self.get_parameter('covered_map_topic').value
@@ -71,10 +79,16 @@ class CStarHoleDetectorNode(Node):
         self.start_after_robot_moved_distance = float(
             self.get_parameter('start_after_robot_moved_distance').value
         )
-        self.local_detection_radius = float(self.get_parameter('local_detection_radius').value)
+
+        self.local_detection_radius = float(
+            self.get_parameter('local_detection_radius').value
+        )
 
         self.min_hole_area = float(self.get_parameter('min_hole_area').value)
         self.max_hole_area = float(self.get_parameter('max_hole_area').value)
+        self.min_local_overlap_area = float(
+            self.get_parameter('min_local_overlap_area').value
+        )
 
         self.unknown_buffer = float(self.get_parameter('unknown_buffer').value)
         self.covered_seal_buffer = float(self.get_parameter('covered_seal_buffer').value)
@@ -82,8 +96,13 @@ class CStarHoleDetectorNode(Node):
         self.min_enclosed_boundary_ratio = float(
             self.get_parameter('min_enclosed_boundary_ratio').value
         )
+
         self.min_covered_boundary_cells = int(
             self.get_parameter('min_covered_boundary_cells').value
+        )
+
+        self.publish_full_hole_region = bool(
+            self.get_parameter('publish_full_hole_region').value
         )
 
         self.free_msg: Optional[OccupancyGrid] = None
@@ -166,6 +185,7 @@ class CStarHoleDetectorNode(Node):
         self.get_logger().info(
             f'min_hole_area={self.min_hole_area:.2f}, '
             f'max_hole_area={self.max_hole_area:.2f}, '
+            f'min_local_overlap_area={self.min_local_overlap_area:.2f}, '
             f'unknown_buffer={self.unknown_buffer:.2f}, '
             f'covered_seal_buffer={self.covered_seal_buffer:.2f}'
         )
@@ -347,13 +367,16 @@ class CStarHoleDetectorNode(Node):
 
         return gate
 
-    def build_candidate_mask(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def build_candidate_mask(
+        self,
+        robot_xy: Optional[Tuple[float, float]]
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
         返回：
         candidate:
             全图 hole 候选区域。
         local_candidate:
-            机器人附近的 hole 候选区域。
+            candidate 和机器人附近 local gate 的交集。
         covered_seal:
             轻微膨胀后的 covered，用于封闭小缝隙。
         obstacle:
@@ -390,7 +413,6 @@ class CStarHoleDetectorNode(Node):
         candidate[covered_seal] = False
         candidate[unknown_block] = False
 
-        robot_xy = self.get_robot_pose()
         if robot_xy is None:
             local_candidate = np.zeros_like(candidate, dtype=bool)
         else:
@@ -445,15 +467,46 @@ class CStarHoleDetectorNode(Node):
                 return True
         return False
 
-    def component_has_local_overlap(
+    def component_local_stats(
         self,
         comp: List[GridCell],
-        local_candidate: np.ndarray
-    ) -> bool:
+        local_candidate: np.ndarray,
+        robot_xy: Tuple[float, float]
+    ) -> Tuple[List[GridCell], float, float]:
+        """
+        返回：
+        local_cells:
+            该连通域中落在机器人 local_detection_radius 内的候选栅格。
+        local_area:
+            local_cells 对应面积。
+        min_distance_to_robot:
+            连通域到机器人的最近距离，单位 m。
+        """
+        assert self.free_msg is not None
+
+        res = self.free_msg.info.resolution
+
+        local_cells: List[GridCell] = []
+        min_distance = float('inf')
+
+        rx, ry = robot_xy
+
         for r, c in comp:
+            x, y = self.cell_to_world((r, c))
+            d = math.hypot(x - rx, y - ry)
+
+            if d < min_distance:
+                min_distance = d
+
             if local_candidate[r, c]:
-                return True
-        return False
+                local_cells.append((r, c))
+
+        local_area = len(local_cells) * res * res
+
+        if min_distance == float('inf'):
+            min_distance = 1e9
+
+        return local_cells, local_area, min_distance
 
     def component_boundary_stats(
         self,
@@ -464,6 +517,7 @@ class CStarHoleDetectorNode(Node):
         h, w = covered_seal.shape
 
         comp_mask = np.zeros((h, w), dtype=bool)
+
         for r, c in comp:
             comp_mask[r, c] = True
 
@@ -471,6 +525,7 @@ class CStarHoleDetectorNode(Node):
         boundary = dilated & np.logical_not(comp_mask)
 
         boundary_count = int(np.count_nonzero(boundary))
+
         if boundary_count <= 0:
             return 0.0, 0
 
@@ -481,6 +536,7 @@ class CStarHoleDetectorNode(Node):
         covered_count = int(np.count_nonzero(covered_boundary))
 
         ratio = float(closed_count) / float(boundary_count)
+
         return ratio, covered_count
 
     def component_centroid(self, comp: List[GridCell]) -> Tuple[float, float]:
@@ -494,14 +550,16 @@ class CStarHoleDetectorNode(Node):
         candidate: np.ndarray,
         local_candidate: np.ndarray,
         covered_seal: np.ndarray,
-        obstacle: np.ndarray
-    ) -> Tuple[np.ndarray, List[Tuple[float, float, float]]]:
+        obstacle: np.ndarray,
+        robot_xy: Optional[Tuple[float, float]]
+    ) -> Tuple[np.ndarray, List[Tuple[float, float, float, float]]]:
         """
         返回：
         hole_mask:
             检测到的 hole 区域。
+            默认只发布 local overlap 区域，避免远处大块区域被染成 hole。
         hole_infos:
-            [(cx, cy, area), ...]
+            [(cx, cy, global_area, local_overlap_area), ...]
         """
         assert self.free_msg is not None
 
@@ -511,27 +569,42 @@ class CStarHoleDetectorNode(Node):
         w = info.width
 
         hole_mask = np.zeros((h, w), dtype=np.int8)
-        hole_infos: List[Tuple[float, float, float]] = []
+        hole_infos: List[Tuple[float, float, float, float]] = []
+
+        if robot_xy is None:
+            return hole_mask, hole_infos
 
         components = self.connected_components(candidate)
 
         for comp in components:
             cell_count = len(comp)
-            area = cell_count * res * res
+            global_area = cell_count * res * res
 
-            if area < self.min_hole_area:
+            # 1. 全局面积过滤：太小的碎片不要
+            if global_area < self.min_hole_area:
                 continue
 
-            if area > self.max_hole_area:
+            if global_area > self.max_hole_area:
                 continue
 
+            # 2. 贴地图边界的不要
             if self.component_touches_border(comp, h, w):
                 continue
 
-            # 关键：只保留机器人附近的 hole，防止全图提前报 hole
-            if not self.component_has_local_overlap(comp, local_candidate):
+            # 3. 局部重叠过滤：必须在小车附近有足够大的一片候选区域
+            local_cells, local_overlap_area, min_distance = self.component_local_stats(
+                comp,
+                local_candidate,
+                robot_xy
+            )
+
+            if local_overlap_area < self.min_local_overlap_area:
                 continue
 
+            if min_distance > self.local_detection_radius:
+                continue
+
+            # 4. 边界封闭性判断
             boundary_ratio, covered_boundary_cells = self.component_boundary_stats(
                 comp,
                 covered_seal,
@@ -544,11 +617,18 @@ class CStarHoleDetectorNode(Node):
             if covered_boundary_cells < self.min_covered_boundary_cells:
                 continue
 
-            for r, c in comp:
+            # 5. 发布 hole 区域
+            if self.publish_full_hole_region:
+                mask_cells = comp
+            else:
+                mask_cells = local_cells
+
+            for r, c in mask_cells:
                 hole_mask[r, c] = 100
 
-            cx, cy = self.component_centroid(comp)
-            hole_infos.append((cx, cy, area))
+            # marker 放在 local overlap 的中心，而不是整个连通域中心
+            cx, cy = self.component_centroid(local_cells)
+            hole_infos.append((cx, cy, global_area, local_overlap_area))
 
         return hole_mask, hole_infos
 
@@ -566,6 +646,7 @@ class CStarHoleDetectorNode(Node):
             out = mask.astype(np.int8)
 
         grid.data = out.reshape(-1).tolist()
+
         return grid
 
     def publish_empty_outputs(self) -> None:
@@ -593,7 +674,10 @@ class CStarHoleDetectorNode(Node):
         ma.markers.append(delete_all)
         self.marker_pub.publish(ma)
 
-    def publish_markers(self, hole_infos: List[Tuple[float, float, float]]) -> None:
+    def publish_markers(
+        self,
+        hole_infos: List[Tuple[float, float, float, float]]
+    ) -> None:
         ma = MarkerArray()
 
         delete_all = Marker()
@@ -618,7 +702,7 @@ class CStarHoleDetectorNode(Node):
         centers.color.a = 0.95
         centers.pose.orientation.w = 1.0
 
-        for i, (x, y, area) in enumerate(hole_infos):
+        for i, (x, y, global_area, local_area) in enumerate(hole_infos):
             p = Point()
             p.x = x
             p.y = y
@@ -641,7 +725,7 @@ class CStarHoleDetectorNode(Node):
             text.color.g = 0.0
             text.color.b = 1.0
             text.color.a = 1.0
-            text.text = f'hole\n{area:.2f}m2'
+            text.text = f'hole\nG:{global_area:.2f}\nL:{local_area:.2f}'
             ma.markers.append(text)
 
         ma.markers.append(centers)
@@ -658,13 +742,14 @@ class CStarHoleDetectorNode(Node):
             self.publish_empty_outputs()
             return
 
-        candidate, local_candidate, covered_seal, obstacle = self.build_candidate_mask()
+        candidate, local_candidate, covered_seal, obstacle = self.build_candidate_mask(robot_xy)
 
         hole_mask, hole_infos = self.detect_holes(
             candidate,
             local_candidate,
             covered_seal,
-            obstacle
+            obstacle,
+            robot_xy
         )
 
         self.hole_candidate_pub.publish(self.build_grid_from_mask(candidate))
