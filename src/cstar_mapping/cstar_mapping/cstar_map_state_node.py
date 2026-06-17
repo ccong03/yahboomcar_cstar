@@ -22,7 +22,7 @@ class CStarMapStateNode(Node):
         self.declare_parameter('map_topic', '/map')
         self.declare_parameter('map_frame', 'map')
         self.declare_parameter('base_frame', 'base_footprint')
-        self.declare_parameter('coverage_radius', 0.20)
+        self.declare_parameter('coverage_radius', 0.15) #原始0.20
         self.declare_parameter('obstacle_threshold', 50)
         self.declare_parameter('publish_period', 0.5)
 

@@ -1,0 +1,17 @@
+[0.732s] Invoking command in '/home/admin/yahboomcar_cstar/build/cstar_planner': PYTHONPATH=/home/admin/yahboomcar_cstar/build/cstar_planner/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/admin/yahboomcar_cstar/install/cstar_planner/lib/python3.10/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py develop --editable --build-directory /home/admin/yahboomcar_cstar/build/cstar_planner/build --no-deps symlink_data
+[0.975s] running develop
+[1.120s] running egg_info
+[1.120s] writing cstar_planner.egg-info/PKG-INFO
+[1.120s] writing dependency_links to cstar_planner.egg-info/dependency_links.txt
+[1.121s] writing entry points to cstar_planner.egg-info/entry_points.txt
+[1.121s] writing requirements to cstar_planner.egg-info/requires.txt
+[1.121s] writing top-level names to cstar_planner.egg-info/top_level.txt
+[1.123s] reading manifest file 'cstar_planner.egg-info/SOURCES.txt'
+[1.123s] writing manifest file 'cstar_planner.egg-info/SOURCES.txt'
+[1.125s] running build_ext
+[1.125s] Creating /home/admin/yahboomcar_cstar/install/cstar_planner/lib/python3.10/site-packages/cstar-planner.egg-link (link to .)
+[1.126s] Installing cstar_waypoint_planner_node script to /home/admin/yahboomcar_cstar/install/cstar_planner/lib/cstar_planner
+[1.126s] 
+[1.126s] Installed /home/admin/yahboomcar_cstar/build/cstar_planner
+[1.126s] running symlink_data
+[1.151s] Invoked command in '/home/admin/yahboomcar_cstar/build/cstar_planner' returned '0': PYTHONPATH=/home/admin/yahboomcar_cstar/build/cstar_planner/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/admin/yahboomcar_cstar/install/cstar_planner/lib/python3.10/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py develop --editable --build-directory /home/admin/yahboomcar_cstar/build/cstar_planner/build --no-deps symlink_data
