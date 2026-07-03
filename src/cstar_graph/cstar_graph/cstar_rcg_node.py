@@ -33,44 +33,51 @@ class CStarRCGNode(Node):
     def __init__(self) -> None:
         super().__init__('cstar_rcg_node')
 
+        # ========== 输入地图 topic ==========
         self.declare_parameter('free_topic', '/cstar/free_map')
         self.declare_parameter('frontier_topic', '/cstar/frontier_map')
         self.declare_parameter('obstacle_topic', '/cstar/obstacle_map')
         self.declare_parameter('unknown_topic', '/cstar/unknown_map')
         self.declare_parameter('map_frame', 'map')
 
-        # 保留你当前偏连通的采样设置，再通过 node spacing 和端点桥接减少乱边
+        # ========== 单层密集 RCG 采样参数 ==========
+        # 目标：生成类似规则网格的 RCG：同一 lap 横向相邻连接，相邻 lap 对应 sample 纵向连接。
         self.declare_parameter('lap_spacing', 0.30)
-        self.declare_parameter('sample_spacing', 0.15)
+        self.declare_parameter('sample_spacing', 0.34)
         self.declare_parameter('frontier_keep_radius', 0.25)
         self.declare_parameter('prune_stride', 1)
         self.declare_parameter('publish_period', 0.5)
 
-        # 端点主动跨 lap 连接：
-        # 不是“端点只能连端点”，而是“端点连到相邻 lap 上最近的 sample”
-        self.declare_parameter('interlap_max_dist', 0.55) #0.75
-        self.declare_parameter('endpoint_to_sample_col_tolerance', 0.25) #0.55 0.22
-        self.declare_parameter('max_interlap_bridges_per_segment_pair', 2) #4
-        self.declare_parameter('enable_endpoint_fallback_bridge', True)
+        # 相邻 lap 对应连边。默认只做近竖直/近对应位置的连边，不做双层图、不做 branch 分类。
+        self.declare_parameter('enable_interlap_grid_edges', True)
+        self.declare_parameter('interlap_max_dist', 0.55)
+        self.declare_parameter('interlap_col_tolerance', 0.18)
 
-        # 安全缓冲区，单位：米
-        self.declare_parameter('obstacle_buffer', 0.12) #0.15
-        self.declare_parameter('unknown_buffer', 0.06) #0.06
-        self.declare_parameter('map_border_buffer', 0.12) #0.15
+        # 如果规则对应连边失败，是否允许端点兜底桥接。
+        # 默认关闭，避免出现非网格状斜边；若局部图断开，可启动时改为 true。
+        self.declare_parameter('enable_endpoint_fallback_bridge', False)
+        self.declare_parameter('endpoint_to_sample_col_tolerance', 0.25)
+        self.declare_parameter('max_endpoint_fallback_edges_per_pair', 2)
 
-        # 过滤太短的安全自由段，避免墙角碎点
+        # 安全缓冲区，单位：米。
+        self.declare_parameter('obstacle_buffer', 0.12)
+        self.declare_parameter('unknown_buffer', 0.06)
+        self.declare_parameter('map_border_buffer', 0.12)
+
+        # 过滤太短的安全自由段，避免墙角碎点。
         self.declare_parameter('min_run_length', 0.30)
 
-        # 节点压缩：减少过近点。端点/frontier 点优先保留
+        # 节点过近过滤。为了保持密集网格，默认距离不要大于 sample_spacing。
         self.declare_parameter('enable_node_spacing_filter', True)
-        self.declare_parameter('min_node_keep_distance', 0.25)
+        self.declare_parameter('min_node_keep_distance', 0.15)
 
-        # 边约束：禁止交叉边
+        # 边约束：禁止交叉边。
         self.declare_parameter('enable_edge_intersection_check', True)
 
         self.declare_parameter('node_size', 0.06)
         self.declare_parameter('edge_width', 0.02)
 
+        # ========== 读取参数 ==========
         self.free_topic = self.get_parameter('free_topic').value
         self.frontier_topic = self.get_parameter('frontier_topic').value
         self.obstacle_topic = self.get_parameter('obstacle_topic').value
@@ -83,15 +90,21 @@ class CStarRCGNode(Node):
         self.prune_stride = max(1, int(self.get_parameter('prune_stride').value))
         self.publish_period = float(self.get_parameter('publish_period').value)
 
+        self.enable_interlap_grid_edges = bool(
+            self.get_parameter('enable_interlap_grid_edges').value
+        )
         self.interlap_max_dist = float(self.get_parameter('interlap_max_dist').value)
+        self.interlap_col_tolerance = float(
+            self.get_parameter('interlap_col_tolerance').value
+        )
+        self.enable_endpoint_fallback_bridge = bool(
+            self.get_parameter('enable_endpoint_fallback_bridge').value
+        )
         self.endpoint_to_sample_col_tolerance = float(
             self.get_parameter('endpoint_to_sample_col_tolerance').value
         )
         self.max_interlap_bridges_per_segment_pair = max(
-            0, int(self.get_parameter('max_interlap_bridges_per_segment_pair').value)
-        )
-        self.enable_endpoint_fallback_bridge = bool(
-            self.get_parameter('enable_endpoint_fallback_bridge').value
+            0, int(self.get_parameter('max_endpoint_fallback_edges_per_pair').value)
         )
 
         self.obstacle_buffer = float(self.get_parameter('obstacle_buffer').value)
@@ -105,7 +118,6 @@ class CStarRCGNode(Node):
         self.min_node_keep_distance = float(
             self.get_parameter('min_node_keep_distance').value
         )
-
         self.enable_edge_intersection_check = bool(
             self.get_parameter('enable_edge_intersection_check').value
         )
@@ -113,6 +125,7 @@ class CStarRCGNode(Node):
         self.node_size = float(self.get_parameter('node_size').value)
         self.edge_width = float(self.get_parameter('edge_width').value)
 
+        # ========== 地图状态 ==========
         self.free_msg: Optional[OccupancyGrid] = None
         self.frontier_msg: Optional[OccupancyGrid] = None
         self.obstacle_msg: Optional[OccupancyGrid] = None
@@ -123,34 +136,37 @@ class CStarRCGNode(Node):
         self.obstacle_arr: Optional[np.ndarray] = None
         self.unknown_arr: Optional[np.ndarray] = None
         self.safe_free_arr: Optional[np.ndarray] = None
-        # relaxed_edge_arr 用于边界/障碍物附近端点的特殊连边判断：
-        # 不检查 map_border_buffer 和 obstacle_buffer，但仍然禁止穿过真实障碍和 unknown_buffer。
+
+        # relaxed_edge_arr 仅用于可选的端点兜底桥接。
         self.relaxed_edge_arr: Optional[np.ndarray] = None
 
+        # ========== 订阅与发布 ==========
         self.create_subscription(OccupancyGrid, self.free_topic, self.free_callback, 10)
         self.create_subscription(OccupancyGrid, self.frontier_topic, self.frontier_callback, 10)
         self.create_subscription(OccupancyGrid, self.obstacle_topic, self.obstacle_callback, 10)
         self.create_subscription(OccupancyGrid, self.unknown_topic, self.unknown_callback, 10)
 
-        self.marker_pub = self.create_publisher(MarkerArray, '/cstar/rcg_markers', 10)
+        # 回归单层 RCG：只发布标准 RCG topic。
         self.nodes_pub = self.create_publisher(PoseArray, '/cstar/rcg_nodes', 10)
+        self.marker_pub = self.create_publisher(MarkerArray, '/cstar/rcg_markers', 10)
 
         self.timer = self.create_timer(self.publish_period, self.on_timer)
 
-        self.get_logger().info('CStarRCGNode endpoint-to-nearest-sample bridge mode started.')
+        self.get_logger().info('CStarRCGNode single-layer grid RCG mode started.')
         self.get_logger().info(
             f'lap_spacing={self.lap_spacing:.2f}, sample_spacing={self.sample_spacing:.2f}, '
             f'prune_stride={self.prune_stride}'
         )
         self.get_logger().info(
+            f'interlap_grid_edges={self.enable_interlap_grid_edges}, '
             f'interlap_max_dist={self.interlap_max_dist:.2f}, '
-            f'endpoint_to_sample_col_tolerance={self.endpoint_to_sample_col_tolerance:.2f}, '
-            f'max_interlap_bridges={self.max_interlap_bridges_per_segment_pair}'
+            f'interlap_col_tolerance={self.interlap_col_tolerance:.2f}'
         )
         self.get_logger().info(
             f'node_spacing_filter={self.enable_node_spacing_filter}, '
             f'min_node_keep_distance={self.min_node_keep_distance:.2f}, '
-            f'edge_intersection_check={self.enable_edge_intersection_check}'
+            f'edge_intersection_check={self.enable_edge_intersection_check}, '
+            f'endpoint_fallback={self.enable_endpoint_fallback_bridge}'
         )
 
     def free_callback(self, msg: OccupancyGrid) -> None:
@@ -194,8 +210,24 @@ class CStarRCGNode(Node):
         self.safe_free_arr = self.build_safe_free_mask()
 
         nodes, edges = self.build_graph()
-        self.publish_pose_array(nodes)
-        self.publish_markers(nodes, edges)
+        self.publish_pose_array_to(self.nodes_pub, nodes)
+        self.publish_graph_markers_to(
+            pub=self.marker_pub,
+            nodes=nodes,
+            edges=edges,
+            node_ns='rcg_nodes',
+            essential_ns='rcg_essential_nodes',
+            edge_ns='rcg_edges',
+            node_color=(0.1, 0.5, 1.0, 0.85),
+            essential_color=(1.0, 0.85, 0.1, 0.95),
+            edge_color=(0.0, 1.0, 1.0, 0.55),
+            node_size_factor=1.0,
+            edge_width_factor=1.0,
+        )
+
+        self.get_logger().info(
+            f'RCG grid published: nodes={len(nodes)}, edges={len(edges)}'
+        )
 
     def metadata_ok(self) -> bool:
         if self.free_msg is None or self.frontier_msg is None:
@@ -312,6 +344,9 @@ class CStarRCGNode(Node):
         frontier_rad = max(1, int(round(self.frontier_keep_radius / res)))
 
         interlap_max_cells = max(1.0, self.interlap_max_dist / res)
+        interlap_col_tol_cells = max(
+            1, int(round(self.interlap_col_tolerance / res))
+        )
         endpoint_col_tol_cells = max(
             1, int(round(self.endpoint_to_sample_col_tolerance / res))
         )
@@ -324,6 +359,7 @@ class CStarRCGNode(Node):
 
         lap_rows = self.collect_lap_rows_from_safe_mask(lap_step)
 
+        # 1. 每条 lap 内部按 sample_spacing 采样，并连接同一安全段内的相邻 sample。
         for lap_id, row in enumerate(lap_rows):
             runs = self.find_safe_runs_on_row(row)
 
@@ -360,63 +396,75 @@ class CStarRCGNode(Node):
                         seg_id=seg_id,
                         essential=(endpoint or near_frontier),
                         endpoint=endpoint,
-                        near_frontier=near_frontier
+                        near_frontier=near_frontier,
                     )
 
                     nodes.append(node)
                     kept_nodes.append(node)
 
-                # same-lap：同一安全段内只连接相邻点
+                # 同一 lap / 同一安全段内只连接相邻点。
                 for a, b in zip(kept_nodes[:-1], kept_nodes[1:]):
                     self.try_add_edge(edges, nodes, a.idx, b.idx)
 
                 lap_seg_to_nodes[(lap_id, seg_id)] = kept_nodes
                 lap_seg_bounds[(lap_id, seg_id)] = (start_col, end_col)
 
-        # inter-lap：端点主动连接相邻 lap 上最近 sample；中间 sample 只作为被连接目标
-        for lap_id in range(len(lap_rows) - 1):
-            row_gap = abs(lap_rows[lap_id + 1] - lap_rows[lap_id])
-            if row_gap > interlap_max_cells:
-                continue
-
-            curr_seg_ids = sorted(
-                key[1] for key in lap_seg_to_nodes.keys() if key[0] == lap_id
-            )
-            next_seg_ids = sorted(
-                key[1] for key in lap_seg_to_nodes.keys() if key[0] == lap_id + 1
-            )
-
-            for curr_seg_id in curr_seg_ids:
-                seg_a = lap_seg_to_nodes.get((lap_id, curr_seg_id), [])
-                if not seg_a:
+        # 2. 相邻 lap 的重叠安全段之间，连接对应位置接近的 sample，形成规则网格纵向边。
+        if self.enable_interlap_grid_edges:
+            for lap_id in range(len(lap_rows) - 1):
+                row_gap = abs(lap_rows[lap_id + 1] - lap_rows[lap_id])
+                if row_gap > interlap_max_cells:
                     continue
 
-                a_start, a_end = lap_seg_bounds[(lap_id, curr_seg_id)]
+                curr_seg_ids = sorted(
+                    key[1] for key in lap_seg_to_nodes.keys() if key[0] == lap_id
+                )
+                next_seg_ids = sorted(
+                    key[1] for key in lap_seg_to_nodes.keys() if key[0] == lap_id + 1
+                )
 
-                for next_seg_id in next_seg_ids:
-                    seg_b = lap_seg_to_nodes.get((lap_id + 1, next_seg_id), [])
-                    if not seg_b:
+                for curr_seg_id in curr_seg_ids:
+                    seg_a = lap_seg_to_nodes.get((lap_id, curr_seg_id), [])
+                    if not seg_a:
                         continue
 
-                    b_start, b_end = lap_seg_bounds[(lap_id + 1, next_seg_id)]
+                    a_start, a_end = lap_seg_bounds[(lap_id, curr_seg_id)]
 
-                    if not self.segments_overlap_or_near(
-                        a_start,
-                        a_end,
-                        b_start,
-                        b_end,
-                        endpoint_col_tol_cells
-                    ):
-                        continue
+                    for next_seg_id in next_seg_ids:
+                        seg_b = lap_seg_to_nodes.get((lap_id + 1, next_seg_id), [])
+                        if not seg_b:
+                            continue
 
-                    self.add_endpoint_to_nearest_sample_edges(
-                        edges=edges,
-                        nodes=nodes,
-                        seg_a=seg_a,
-                        seg_b=seg_b,
-                        interlap_max_cells=interlap_max_cells,
-                        endpoint_col_tol_cells=endpoint_col_tol_cells,
-                    )
+                        b_start, b_end = lap_seg_bounds[(lap_id + 1, next_seg_id)]
+
+                        if not self.segments_overlap_or_near(
+                            a_start,
+                            a_end,
+                            b_start,
+                            b_end,
+                            interlap_col_tol_cells,
+                        ):
+                            continue
+
+                        added = self.add_interlap_grid_edges(
+                            edges=edges,
+                            nodes=nodes,
+                            seg_a=seg_a,
+                            seg_b=seg_b,
+                            interlap_max_cells=interlap_max_cells,
+                            interlap_col_tol_cells=interlap_col_tol_cells,
+                        )
+
+                        # 可选兜底：只在规则对应连边完全失败时使用端点桥接。
+                        if added == 0 and self.enable_endpoint_fallback_bridge:
+                            self.add_endpoint_to_nearest_sample_edges(
+                                edges=edges,
+                                nodes=nodes,
+                                seg_a=seg_a,
+                                seg_b=seg_b,
+                                interlap_max_cells=interlap_max_cells,
+                                endpoint_col_tol_cells=endpoint_col_tol_cells,
+                            )
 
         self.get_logger().info(
             f'RCG rebuilt: nodes={len(nodes)}, edges={len(edges)}, laps={len(lap_rows)}'
@@ -445,6 +493,66 @@ class CStarRCGNode(Node):
 
         ordered = sorted(seg_nodes, key=lambda n: n.col)
         return ordered[0], ordered[-1]
+
+    def add_interlap_grid_edges(
+        self,
+        edges: Set[Tuple[int, int]],
+        nodes: List[GraphNode],
+        seg_a: List[GraphNode],
+        seg_b: List[GraphNode],
+        interlap_max_cells: float,
+        interlap_col_tol_cells: int,
+    ) -> int:
+        """
+        单层密集 RCG 的相邻 lap 对应连边。
+
+        规则：
+        - 只连接相邻 lap 中 col 位置接近的 sample；
+        - 每个 sample 在这一对 lap segment 中最多承担一条纵向对应边，避免星形乱连；
+        - 所有边必须通过安全线段检查和交叉检查；
+        - 因此最终形态接近规则网格，而不是双层图或带 branch 分类的图。
+        """
+        if not seg_a or not seg_b:
+            return 0
+
+        pair_candidates: List[Tuple[float, float, GraphNode, GraphNode]] = []
+
+        for a in sorted(seg_a, key=lambda n: n.col):
+            for b in sorted(seg_b, key=lambda n: n.col):
+                if a.idx == b.idx:
+                    continue
+
+                drow = float(b.row - a.row)
+                dcol = float(b.col - a.col)
+                dist = math.hypot(drow, dcol)
+
+                if dist > interlap_max_cells:
+                    continue
+
+                if abs(dcol) > interlap_col_tol_cells:
+                    continue
+
+                if not self.edge_line_is_acceptable(a, b):
+                    continue
+
+                pair_candidates.append((abs(dcol), dist, a, b))
+
+        pair_candidates.sort(key=lambda item: (item[0], item[1]))
+
+        added = 0
+        used_a: Set[int] = set()
+        used_b: Set[int] = set()
+
+        for _, _, a, b in pair_candidates:
+            if a.idx in used_a or b.idx in used_b:
+                continue
+
+            if self.try_add_edge(edges, nodes, a.idx, b.idx):
+                used_a.add(a.idx)
+                used_b.add(b.idx)
+                added += 1
+
+        return added
 
     def add_endpoint_to_nearest_sample_edges(
         self,
@@ -945,7 +1053,8 @@ class CStarRCGNode(Node):
 
         return sorted(rows)
 
-    def publish_pose_array(self, nodes: List[GraphNode]) -> None:
+
+    def publish_pose_array_to(self, pub, nodes: List[GraphNode]) -> None:
         msg = PoseArray()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = self.map_frame
@@ -958,9 +1067,22 @@ class CStarRCGNode(Node):
             p.orientation.w = 1.0
             msg.poses.append(p)
 
-        self.nodes_pub.publish(msg)
+        pub.publish(msg)
 
-    def publish_markers(self, nodes: List[GraphNode], edges: Set[Tuple[int, int]]) -> None:
+    def publish_graph_markers_to(
+        self,
+        pub,
+        nodes: List[GraphNode],
+        edges: Set[Tuple[int, int]],
+        node_ns: str,
+        essential_ns: str,
+        edge_ns: str,
+        node_color: Tuple[float, float, float, float],
+        essential_color: Tuple[float, float, float, float],
+        edge_color: Tuple[float, float, float, float],
+        node_size_factor: float = 1.0,
+        edge_width_factor: float = 1.0,
+    ) -> None:
         ma = MarkerArray()
 
         delete_all = Marker()
@@ -972,47 +1094,47 @@ class CStarRCGNode(Node):
         normal_nodes = Marker()
         normal_nodes.header.frame_id = self.map_frame
         normal_nodes.header.stamp = self.get_clock().now().to_msg()
-        normal_nodes.ns = 'rcg_nodes'
+        normal_nodes.ns = node_ns
         normal_nodes.id = 0
         normal_nodes.type = Marker.SPHERE_LIST
         normal_nodes.action = Marker.ADD
-        normal_nodes.scale.x = self.node_size
-        normal_nodes.scale.y = self.node_size
-        normal_nodes.scale.z = self.node_size
-        normal_nodes.color.r = 0.1
-        normal_nodes.color.g = 0.5
-        normal_nodes.color.b = 1.0
-        normal_nodes.color.a = 0.85
+        normal_nodes.scale.x = self.node_size * node_size_factor
+        normal_nodes.scale.y = self.node_size * node_size_factor
+        normal_nodes.scale.z = self.node_size * node_size_factor
+        normal_nodes.color.r = node_color[0]
+        normal_nodes.color.g = node_color[1]
+        normal_nodes.color.b = node_color[2]
+        normal_nodes.color.a = node_color[3]
         normal_nodes.pose.orientation.w = 1.0
 
         essential_nodes = Marker()
         essential_nodes.header.frame_id = self.map_frame
         essential_nodes.header.stamp = self.get_clock().now().to_msg()
-        essential_nodes.ns = 'rcg_essential_nodes'
+        essential_nodes.ns = essential_ns
         essential_nodes.id = 1
         essential_nodes.type = Marker.SPHERE_LIST
         essential_nodes.action = Marker.ADD
-        essential_nodes.scale.x = self.node_size * 1.2
-        essential_nodes.scale.y = self.node_size * 1.2
-        essential_nodes.scale.z = self.node_size * 1.2
-        essential_nodes.color.r = 1.0
-        essential_nodes.color.g = 0.85
-        essential_nodes.color.b = 0.1
-        essential_nodes.color.a = 0.95
+        essential_nodes.scale.x = self.node_size * 1.2 * node_size_factor
+        essential_nodes.scale.y = self.node_size * 1.2 * node_size_factor
+        essential_nodes.scale.z = self.node_size * 1.2 * node_size_factor
+        essential_nodes.color.r = essential_color[0]
+        essential_nodes.color.g = essential_color[1]
+        essential_nodes.color.b = essential_color[2]
+        essential_nodes.color.a = essential_color[3]
         essential_nodes.pose.orientation.w = 1.0
 
         edge_marker = Marker()
         edge_marker.header.frame_id = self.map_frame
         edge_marker.header.stamp = self.get_clock().now().to_msg()
-        edge_marker.ns = 'rcg_edges'
+        edge_marker.ns = edge_ns
         edge_marker.id = 2
         edge_marker.type = Marker.LINE_LIST
         edge_marker.action = Marker.ADD
-        edge_marker.scale.x = self.edge_width
-        edge_marker.color.r = 0.0
-        edge_marker.color.g = 1.0
-        edge_marker.color.b = 1.0
-        edge_marker.color.a = 0.55
+        edge_marker.scale.x = self.edge_width * edge_width_factor
+        edge_marker.color.r = edge_color[0]
+        edge_marker.color.g = edge_color[1]
+        edge_marker.color.b = edge_color[2]
+        edge_marker.color.a = edge_color[3]
         edge_marker.pose.orientation.w = 1.0
 
         for n in nodes:
@@ -1027,6 +1149,9 @@ class CStarRCGNode(Node):
                 normal_nodes.points.append(pt)
 
         for i, j in sorted(edges):
+            if i < 0 or j < 0 or i >= len(nodes) or j >= len(nodes):
+                continue
+
             ni = nodes[i]
             nj = nodes[j]
 
@@ -1047,7 +1172,7 @@ class CStarRCGNode(Node):
         ma.markers.append(essential_nodes)
         ma.markers.append(edge_marker)
 
-        self.marker_pub.publish(ma)
+        pub.publish(ma)
 
 
 def main(args=None) -> None:

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+#配合cstar_rcgnodecopy的版本。
 import heapq
 import math
 from collections import deque
@@ -144,6 +145,20 @@ class CStarWaypointPlannerNode(Node):
         self.declare_parameter('hole_entry_exit_on_boundary_lap', True)
         self.declare_parameter('hole_boundary_entry_s_margin', 0.25)
         self.declare_parameter('hole_boundary_entry_search_distance', 0.55)
+
+        # branch-seed hole predictor:
+        # 不再使用 doorway gap。只在 boundary_lap 上寻找“向 hole 内部延伸的侧向 RCG 分支边”。
+        # boundary_key 可以是 closed sample；seed_key 必须是分支边另一端的 open sample。
+        # 本验证版只使用 branch seed，不使用普通 seed 兜底。
+        self.declare_parameter('hole_enable_branch_seed_predictor', True)
+        self.declare_parameter('hole_branch_lookahead_distance', 1.20)
+        self.declare_parameter('hole_branch_no_backtrack_margin', 0.08)
+        self.declare_parameter('hole_branch_lateral_min_distance', 0.18)
+        self.declare_parameter('hole_branch_lateral_ratio', 1.40)
+        self.declare_parameter('hole_branch_max_along_offset', 0.25)
+        self.declare_parameter('hole_branch_max_seed_distance', 0.75)
+        self.declare_parameter('hole_branch_max_candidates', 8)
+
 
         # ========== dynamic hole entry/exit + orthogonal repair 可视化 ==========
         # 不固定 hole_area；只在当前活跃 hole 上锁定 entry/exit。
@@ -304,6 +319,32 @@ class CStarWaypointPlannerNode(Node):
             self.get_parameter('hole_boundary_entry_search_distance').value
         )
 
+        self.hole_enable_branch_seed_predictor = bool(
+            self.get_parameter('hole_enable_branch_seed_predictor').value
+        )
+        self.hole_branch_lookahead_distance = float(
+            self.get_parameter('hole_branch_lookahead_distance').value
+        )
+        self.hole_branch_no_backtrack_margin = float(
+            self.get_parameter('hole_branch_no_backtrack_margin').value
+        )
+        self.hole_branch_lateral_min_distance = float(
+            self.get_parameter('hole_branch_lateral_min_distance').value
+        )
+        self.hole_branch_lateral_ratio = float(
+            self.get_parameter('hole_branch_lateral_ratio').value
+        )
+        self.hole_branch_max_along_offset = float(
+            self.get_parameter('hole_branch_max_along_offset').value
+        )
+        self.hole_branch_max_seed_distance = float(
+            self.get_parameter('hole_branch_max_seed_distance').value
+        )
+        self.hole_branch_max_candidates = int(
+            self.get_parameter('hole_branch_max_candidates').value
+        )
+
+
         self.hole_incomplete_unknown_area = float(
             self.get_parameter('hole_incomplete_unknown_area').value
         )
@@ -385,6 +426,21 @@ class CStarWaypointPlannerNode(Node):
         self.active_hole_exit: Optional[Tuple[float, float]] = None
         self.active_hole_entry_key: Optional[NodeKey] = None
         self.active_hole_exit_key: Optional[NodeKey] = None
+        # branch seed 当前帧给出的 entry/exit。
+        # entry 优先使用侧向 RCG 分支的 seed；exit 固定在 boundary_lap 上。
+        # 同一个 active hole 后续动态更新时仍保持锁定，不让 entry/exit 漂移。
+        self.pending_hole_entry_key: Optional[NodeKey] = None
+        self.pending_hole_exit_key: Optional[NodeKey] = None
+
+        # branch trigger 预判状态：
+        # 在当前 sample 选择 next_goal 时，如果 next_goal 本身就是 boundary_lap 上
+        # 带侧向 RCG 分支边的 boundary_key，就先把 seed 存起来；
+        # 等小车真正到达这个 next_goal 后，再从该 seed 立即 floodfill/repair。
+        self.pending_branch_trigger_goal_key: Optional[NodeKey] = None
+        self.pending_branch_trigger_seed_key: Optional[NodeKey] = None
+        self.pending_branch_trigger_boundary_key: Optional[NodeKey] = None
+        self.pending_branch_trigger_score: float = 0.0
+
         self.latest_hole_repair_path: List[Tuple[float, float]] = []
         self.hole_detection_armed = False
         self.last_hole_dynamic_update_time = None
@@ -471,6 +527,12 @@ class CStarWaypointPlannerNode(Node):
             f'hole_entry_exit_on_boundary_lap={self.hole_entry_exit_on_boundary_lap}, '
             f's_margin={self.hole_boundary_entry_s_margin:.2f}, '
             f'search_distance={self.hole_boundary_entry_search_distance:.2f}'
+        )
+        self.get_logger().info(
+            f'hole_branch_seed_predictor={self.hole_enable_branch_seed_predictor}, '
+            f'lookahead={self.hole_branch_lookahead_distance:.2f}, '
+            f'lateral_min={self.hole_branch_lateral_min_distance:.2f}, '
+            f'lateral_ratio={self.hole_branch_lateral_ratio:.2f}'
         )
         self.get_logger().info(
             f'hole_local_gate={self.hole_local_gate_enable}, '
@@ -1297,82 +1359,292 @@ class CStarWaypointPlannerNode(Node):
     # ==========================
 
 
+
+    def collect_branch_hole_seed_pairs(
+        self,
+        current_key: NodeKey,
+        next_goal_key: Optional[NodeKey],
+        robot_xy: Tuple[float, float]
+    ) -> List[Tuple[NodeKey, NodeKey, float]]:
+        """
+        在当前 boundary_lap 前方寻找“侧向 RCG 分支边”。
+
+        返回：
+            [(seed_key, boundary_key, score), ...]
+
+        boundary_key:
+            位于当前 boundary_lap 上的采样点，可以是 closed sample。
+            因为小车出生点不确定，boundary_lap 上已经被覆盖/染红的点仍可能是有效门口点。
+
+        seed_key:
+            boundary_key 的邻接点，必须是 open sample；
+            它是向 hole 内部延伸的分支边另一端，用作 floodfill seed。
+
+        这版特意不加入普通 seed 兜底，方便单独验证“侧向 RCG 分支边”
+        是否足以提前发现 hole。
+        """
+        if not self.hole_enable_branch_seed_predictor:
+            return []
+
+        if current_key not in self.nodes:
+            return []
+
+        if next_goal_key is None or next_goal_key not in self.nodes:
+            return []
+
+        if not self.is_next_goal_on_same_lap(current_key, next_goal_key):
+            return []
+
+        basis = self.get_current_lap_motion_basis(current_key, next_goal_key)
+        if basis is None:
+            return []
+
+        u, n1, _, origin = basis
+        vx, vy = n1
+
+        lap_nodes = self.collect_same_lap_segment_nodes(current_key)
+        if not lap_nodes:
+            return []
+
+        robot_s = (robot_xy[0] - origin[0]) * u[0] + (robot_xy[1] - origin[1]) * u[1]
+
+        no_back = max(0.0, self.hole_branch_no_backtrack_margin)
+        lookahead = max(0.05, self.hole_branch_lookahead_distance)
+        min_lat = max(0.02, self.hole_branch_lateral_min_distance)
+        ratio = max(1.0, self.hole_branch_lateral_ratio)
+        max_along = max(0.02, self.hole_branch_max_along_offset)
+        max_dist = max(min_lat, self.hole_branch_max_seed_distance)
+
+        candidates: List[Tuple[float, NodeKey, NodeKey]] = []
+
+        for boundary_key in lap_nodes:
+            if boundary_key not in self.nodes:
+                continue
+
+            bx, by = self.nodes[boundary_key]
+            boundary_s = (bx - origin[0]) * u[0] + (by - origin[1]) * u[1]
+
+            # 只看机器人当前前方一段 boundary_lap；允许极小 backtrack 容差。
+            if boundary_s < robot_s - no_back:
+                continue
+
+            if boundary_s > robot_s + lookahead:
+                continue
+
+            # boundary_key 可以 closed，但 seed_key 必须 open。
+            for seed_key in self.adjacency.get(boundary_key, set()):
+                if seed_key not in self.nodes:
+                    continue
+
+                if seed_key == current_key or seed_key == next_goal_key:
+                    continue
+
+                if self.is_closed_key(seed_key):
+                    continue
+
+                sx, sy = self.nodes[seed_key]
+                dx = sx - bx
+                dy = sy - by
+                edge_dist = math.hypot(dx, dy)
+
+                if edge_dist < 1e-6 or edge_dist > max_dist:
+                    continue
+
+                edge_along = dx * u[0] + dy * u[1]
+                edge_lateral_signed = dx * vx + dy * vy
+                edge_lateral = abs(edge_lateral_signed)
+
+                # 不是同一条 lap 上的普通左右边，而是明显向侧方伸出的分支边。
+                if edge_lateral < min_lat:
+                    continue
+
+                if edge_lateral < ratio * abs(edge_along):
+                    continue
+
+                if abs(edge_along) > max_along:
+                    continue
+
+                # seed 应该确实离开当前 boundary_lap，而不是 y 方向抖动造成的假侧边。
+                _, seed_t = self.project_in_sweep_frame(sx, sy, origin, u, (vx, vy))
+                if abs(seed_t) < min_lat:
+                    continue
+
+                score = max(0.0, boundary_s - robot_s) + 0.15 * edge_dist
+                candidates.append((score, seed_key, boundary_key))
+
+        candidates.sort(key=lambda item: item[0])
+
+        out: List[Tuple[NodeKey, NodeKey, float]] = []
+        used_seeds: Set[NodeKey] = set()
+        used_edges: Set[Tuple[NodeKey, NodeKey]] = set()
+
+        for score, seed_key, boundary_key in candidates:
+            if seed_key in used_seeds:
+                continue
+
+            edge_id = (seed_key, boundary_key)
+            if edge_id in used_edges:
+                continue
+
+            used_seeds.add(seed_key)
+            used_edges.add(edge_id)
+            out.append((seed_key, boundary_key, score))
+
+            if len(out) >= max(1, self.hole_branch_max_candidates):
+                break
+
+        return out
+
+    def select_branch_exit_key_for_component(
+        self,
+        comp: Set[NodeKey],
+        current_key: NodeKey,
+        next_goal_key: Optional[NodeKey],
+        robot_xy: Tuple[float, float],
+        boundary_key: Optional[NodeKey]
+    ) -> Optional[NodeKey]:
+        """
+        为 branch-seed hole 选择 exit。
+
+        约束：
+        - exit 必须在当前 boundary_lap 上；
+        - exit 尽量位于当前 C* 前进方向上、hole component 投影范围的后端；
+        - boundary_key 可以是 closed sample，因此 exit 也允许是 closed sample；
+        - 如果找不到足够好的后端点，则退回到 boundary_key，保证先能可视化验证。
+        """
+        if not comp or current_key not in self.nodes:
+            return None
+
+        if next_goal_key is None or next_goal_key not in self.nodes:
+            return None
+
+        basis = self.get_current_lap_motion_basis(current_key, next_goal_key)
+        if basis is None:
+            return None
+
+        u, n1, _, origin = basis
+        v = n1
+
+        lap_nodes = self.collect_same_lap_segment_nodes(current_key)
+        if not lap_nodes:
+            return boundary_key if boundary_key in self.nodes else None
+
+        comp_s: List[float] = []
+        for key in comp:
+            if key not in self.nodes:
+                continue
+            x, y = self.nodes[key]
+            s_coord, _ = self.project_in_sweep_frame(x, y, origin, u, v)
+            comp_s.append(s_coord)
+
+        if not comp_s:
+            return boundary_key if boundary_key in self.nodes else None
+
+        min_s = min(comp_s)
+        max_s = max(comp_s)
+
+        boundary_s = None
+        if boundary_key in self.nodes:
+            boundary_s, _ = self.project_in_sweep_frame(
+                self.nodes[boundary_key][0],
+                self.nodes[boundary_key][1],
+                origin,
+                u,
+                v
+            )
+
+        robot_s = (robot_xy[0] - origin[0]) * u[0] + (robot_xy[1] - origin[1]) * u[1]
+        lower_s = max(robot_s - self.hole_branch_no_backtrack_margin, min_s - self.hole_boundary_entry_s_margin)
+        if boundary_s is not None:
+            lower_s = max(lower_s, boundary_s - 0.05)
+
+        target_s = max_s + self.hole_boundary_entry_s_margin
+        max_dist_to_hole = max(0.10, self.hole_boundary_entry_search_distance)
+        min_sep = max(0.05, self.hole_min_entry_exit_distance)
+
+        candidates: List[Tuple[float, float, float, NodeKey]] = []
+
+        bx = by = None
+        if boundary_key in self.nodes:
+            bx, by = self.nodes[boundary_key]
+
+        for key in lap_nodes:
+            if key not in self.nodes:
+                continue
+
+            x, y = self.nodes[key]
+            s_coord, t_coord = self.project_in_sweep_frame(x, y, origin, u, v)
+
+            if s_coord < lower_s:
+                continue
+
+            if abs(t_coord) > max(self.same_lap_y_tolerance * 2.0, self.hole_doorway_band_width):
+                continue
+
+            dist_to_hole = self.min_distance_from_node_to_component(key, comp)
+            in_projection_window = (s_coord >= min_s - self.hole_boundary_entry_s_margin and
+                                    s_coord <= max_s + self.hole_boundary_entry_s_margin)
+            near_hole = dist_to_hole <= max_dist_to_hole
+
+            if not in_projection_window and not near_hole:
+                continue
+
+            if bx is not None and by is not None:
+                sep = math.hypot(x - bx, y - by)
+                if sep < min_sep:
+                    # 不直接丢掉，给较大惩罚，避免小 hole 完全找不到 exit。
+                    sep_penalty = min_sep - sep
+                else:
+                    sep_penalty = 0.0
+            else:
+                sep_penalty = 0.0
+
+            # 越靠近 hole 投影后端、越靠近 component，越适合作为 exit。
+            score = abs(s_coord - target_s) + 0.35 * dist_to_hole + 2.0 * sep_penalty
+            # 负的 s_coord 轻微惩罚，避免选到机器人后方。
+            if s_coord < robot_s:
+                score += 1.0 + (robot_s - s_coord)
+
+            candidates.append((score, -s_coord, dist_to_hole, key))
+
+        if candidates:
+            candidates.sort(key=lambda item: (item[0], item[2], item[1]))
+            return candidates[0][3]
+
+        return boundary_key if boundary_key in self.nodes else None
+
+    def nearest_component_key_to_xy(
+        self,
+        comp: Set[NodeKey],
+        xy: Tuple[float, float]
+    ) -> Optional[NodeKey]:
+        best_key = None
+        best_dist = float('inf')
+
+        for key in comp:
+            if key not in self.nodes:
+                continue
+            x, y = self.nodes[key]
+            d = math.hypot(x - xy[0], y - xy[1])
+            if d < best_dist:
+                best_dist = d
+                best_key = key
+
+        return best_key
+
     def collect_hole_seed_nodes(
         self,
         current_key: NodeKey,
         next_goal_key: Optional[NodeKey]
     ) -> List[NodeKey]:
         """
-        扩大但受控的 hole seed 选择。
+        本验证版不再使用普通 seed 兜底。
 
-        原来的 seed 只看 current_key 附近，因此小车往往走到洞口末端才检测到 hole。
-        这里增加一条“沿当前 C* 前进方向的前视走廊”：
-        - current_key 的直接 Open 邻居保留；
-        - current_key 附近半径内的 Open 节点保留；
-        - current_key -> next_goal_key 方向前方一段距离内、且在侧向门控距离内的 Open 节点也作为 seed。
-
-        这样可以在小车刚到洞口前半段时，就提前把旁边的 hole component 找出来。
+        hole detection 的 seed 只来自 collect_branch_hole_seed_pairs()：
+        boundary_lap 上的 sample 如果存在明显向 hole 内部延伸的侧向 RCG 边，
+        则把这条边另一端的 open sample 作为 floodfill seed。
         """
-        if current_key not in self.nodes:
-            return []
-
-        cx, cy = self.nodes[current_key]
-        r = max(0.0, self.hole_seed_search_radius)
-        r2 = r * r
-
-        seed_set: Set[NodeKey] = set()
-
-        for nb in self.adjacency.get(current_key, set()):
-            if nb in self.nodes and nb != next_goal_key and not self.is_closed_key(nb):
-                seed_set.add(nb)
-
-        use_forward_gate = next_goal_key is not None and next_goal_key in self.nodes
-        if use_forward_gate:
-            gx, gy = self.nodes[next_goal_key]
-            vx = gx - cx
-            vy = gy - cy
-            seg_len = math.hypot(vx, vy)
-
-            if seg_len > 1e-6:
-                ux = vx / seg_len
-                uy = vy / seg_len
-            else:
-                use_forward_gate = False
-                ux = 1.0
-                uy = 0.0
-        else:
-            ux = 1.0
-            uy = 0.0
-            seg_len = 0.0
-
-        for key, (x, y) in self.nodes.items():
-            if key == current_key or key == next_goal_key:
-                continue
-
-            if self.is_closed_key(key):
-                continue
-
-            dx = x - cx
-            dy = y - cy
-
-            if dx * dx + dy * dy <= r2:
-                seed_set.add(key)
-                continue
-
-            if use_forward_gate:
-                along = dx * ux + dy * uy
-                lateral = abs(-uy * dx + ux * dy)
-
-                in_forward_window = (
-                    along >= -self.hole_local_backward_extension and
-                    along <= seg_len + self.hole_local_forward_extension
-                )
-                in_lateral_window = lateral <= self.hole_local_segment_distance
-
-                if in_forward_window and in_lateral_window:
-                    seed_set.add(key)
-
-        return list(seed_set)
+        return []
 
     def is_next_goal_on_same_lap(
         self,
@@ -1588,6 +1860,45 @@ class CStarWaypointPlannerNode(Node):
         best_ratio = max(side1_ratio, side2_ratio)
 
         return best_ratio >= self.hole_boundary_min_ratio
+
+
+    def get_current_lap_motion_basis(
+        self,
+        current_key: NodeKey,
+        next_goal_key: NodeKey
+    ) -> Optional[Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float], Tuple[float, float]]]:
+        """
+        返回当前 boundary_lap 的运动坐标系：
+        u：当前 C* 前进方向；n1/n2：lap 两侧法向；origin：current_key 坐标。
+        """
+        if current_key not in self.nodes or next_goal_key not in self.nodes:
+            return None
+
+        cx, cy = self.nodes[current_key]
+        gx, gy = self.nodes[next_goal_key]
+        ux = gx - cx
+        uy = gy - cy
+        norm = math.hypot(ux, uy)
+
+        if norm < 1e-6:
+            ux = 1.0 if self.sweep_dir >= 0.0 else -1.0
+            uy = 0.0
+        else:
+            ux /= norm
+            uy /= norm
+
+        n1 = (-uy, ux)
+        n2 = (uy, -ux)
+        return (ux, uy), n1, n2, (cx, cy)
+
+    def node_s_on_lap(
+        self,
+        key: NodeKey,
+        origin: Tuple[float, float],
+        u: Tuple[float, float]
+    ) -> float:
+        x, y = self.nodes[key]
+        return (x - origin[0]) * u[0] + (y - origin[1]) * u[1]
 
     def component_main_lap_ratio(
         self,
@@ -1863,28 +2174,124 @@ class CStarWaypointPlannerNode(Node):
 
         return True
 
-    def detect_holes_after_next_goal(
+    def clear_pending_branch_trigger(self) -> None:
+        self.pending_branch_trigger_goal_key = None
+        self.pending_branch_trigger_seed_key = None
+        self.pending_branch_trigger_boundary_key = None
+        self.pending_branch_trigger_score = 0.0
+
+    def find_branch_trigger_for_goal(
+        self,
+        current_key: NodeKey,
+        next_goal_key: Optional[NodeKey],
+        robot_xy: Tuple[float, float]
+    ) -> Optional[Tuple[NodeKey, NodeKey, float]]:
+        """
+        判断刚选出来的 goal_marker 是否就是 boundary_key。
+
+        新逻辑：
+        - 不再“先缓存，等到达后执行”；
+        - 只要 next_goal_key 本身就是带侧向 RCG 分支边的 boundary_key，
+          就立即返回 (seed_key, boundary_key, score)，由 on_timer 直接进入 hole 过程。
+        """
+        if not self.enable_hole_detection:
+            return None
+
+        if current_key not in self.nodes:
+            return None
+
+        if next_goal_key is None or next_goal_key not in self.nodes:
+            return None
+
+        if self.hole_disable_during_escape and self.escape_active:
+            return None
+
+        if self.is_lap_switch_goal(current_key, next_goal_key):
+            return None
+
+        if self.hole_enable_boundary_lap_gate:
+            if not self.is_current_lap_near_buffer(current_key, next_goal_key):
+                return None
+
+        branch_pairs = self.collect_branch_hole_seed_pairs(
+            current_key,
+            next_goal_key,
+            robot_xy
+        )
+
+        matched: List[Tuple[float, NodeKey, NodeKey]] = []
+        for seed_key, boundary_key, score in branch_pairs:
+            if boundary_key == next_goal_key:
+                matched.append((score, seed_key, boundary_key))
+
+        if not matched:
+            return None
+
+        matched.sort(key=lambda item: item[0])
+        score, seed_key, boundary_key = matched[0]
+        return seed_key, boundary_key, score
+
+    def arm_branch_trigger_for_next_goal(
         self,
         current_key: NodeKey,
         next_goal_key: Optional[NodeKey],
         robot_xy: Tuple[float, float]
     ) -> None:
         """
-        只做 RCG-based hole detection 可视化，不改变 C* 运动逻辑。
+        兼容旧接口。当前版本不再使用“预判后等待到达”的触发方式。
+        这里只做清空，真正触发由 find_branch_trigger_for_goal() 在选出 goal_marker 后立即完成。
+        """
+        self.clear_pending_branch_trigger()
 
-        触发时机：
-        1. current_key 已到达；
-        2. normal C* 已选出 next_goal_key；
-        3. 从 current_key 的 Open 邻居开始 floodfill；
-        4. Closed 节点作为边界；
-        5. next_goal_key 作为边界，不进入；
-        6. unknown 不再一票否决，只有 significant unknown 才认为是 frontier；
-        7. 通过节点数和 bbox 面积阈值后标记为 hole/potential hole。
+    def consume_branch_trigger_if_arrived(
+        self,
+        current_key: NodeKey
+    ) -> Optional[Tuple[NodeKey, NodeKey, float]]:
+        """
+        如果小车当前真正到达了之前预判的 boundary_key，则取出对应 seed。
+        返回 (seed_key, boundary_key, score)。
+        """
+        if self.pending_branch_trigger_goal_key is None:
+            return None
+
+        if current_key != self.pending_branch_trigger_goal_key:
+            return None
+
+        seed_key = self.pending_branch_trigger_seed_key
+        boundary_key = self.pending_branch_trigger_boundary_key
+        score = self.pending_branch_trigger_score
+
+        self.clear_pending_branch_trigger()
+
+        if seed_key is None or boundary_key is None:
+            return None
+
+        if seed_key not in self.nodes or boundary_key not in self.nodes:
+            return None
+
+        return seed_key, boundary_key, score
+
+    def detect_hole_from_goal_branch_trigger(
+        self,
+        current_key: NodeKey,
+        next_goal_key: Optional[NodeKey],
+        robot_xy: Tuple[float, float],
+        seed_key: NodeKey,
+        boundary_key: NodeKey,
+        branch_score: float
+    ) -> None:
+        """
+        当刚选出的 goal_marker 本身就是 boundary_key 时，立即从对应 branch seed 做 floodfill。
+
+        这一版不等待小车到达 boundary_key；goal_marker 一旦被判定为 boundary_key，
+        就直接进入 hole detection / repair 可视化过程。
         """
         self.latest_hole_components = []
         self.latest_hole_infos = []
         self.latest_hole_samples = []
         self.latest_hole_repair_path = []
+        self.pending_hole_entry_key = None
+        self.pending_hole_exit_key = None
 
         if not self.enable_hole_detection:
             return
@@ -1898,80 +2305,183 @@ class CStarWaypointPlannerNode(Node):
         if self.hole_disable_during_escape and self.escape_active:
             return
 
-        # 边界 lap 门控：只有当前正在沿“最靠近 buffer 的第一条 lap”正常前进时，
-        # 才允许检测 hole 并生成 repair path。
-        # 中间 lap 或换 lap 阶段不处理 hole，因为这些区域通常会被普通 C* 覆盖。
         if self.hole_enable_boundary_lap_gate:
             if not self.is_current_lap_near_buffer(current_key, next_goal_key):
                 return
 
-        # 原来只从 current_key 的直接 Open 邻居开始 floodfill。
-        # 现在扩大为：
-        # 1. current_key 的直接 Open 邻居；
-        # 2. current_key 附近 hole_seed_search_radius 半径内的 Open 节点。
-        #
-        # 这样可以检测到“视觉上就在旁边，但 RCG 图上隔了 1~2 个节点”的房间型 hole。
-        seeds = self.collect_hole_seed_nodes(current_key, next_goal_key)
-
-        if not seeds:
+        visited: Set[NodeKey] = set()
+        comp = self.floodfill_open_component(seed_key, next_goal_key, visited)
+        if not comp:
             return
 
-        visited: Set[NodeKey] = set()
-        candidate_holes: List[Tuple[float, Set[NodeKey], Tuple[float, float, int, float, float, float, str]]] = []
+        if self.should_protect_component_as_main_sweep(comp, current_key, next_goal_key):
+            return
 
-        for seed in seeds:
-            if seed in visited:
+        if not self.component_passes_local_hole_gate(comp, current_key, next_goal_key, robot_xy):
+            return
+
+        ok, info = self.validate_hole_component(comp, robot_xy)
+        if not ok or info is None:
+            return
+
+        entry_key = seed_key if seed_key in comp else self.nearest_component_key_to_xy(comp, robot_xy)
+        exit_key = self.select_branch_exit_key_for_component(
+            comp,
+            current_key,
+            next_goal_key,
+            robot_xy,
+            boundary_key
+        )
+
+        self.latest_hole_components = [comp]
+        self.latest_hole_infos = [info]
+        self.pending_hole_entry_key = entry_key
+        self.pending_hole_exit_key = exit_key
+
+        if self.pending_hole_entry_key in self.nodes and self.pending_hole_exit_key in self.nodes:
+            self.build_hole_repair_path(current_key, robot_xy, next_goal_key)
+
+        entry_msg = str(self.pending_hole_entry_key) if self.pending_hole_entry_key is not None else 'None'
+        exit_msg = str(self.pending_hole_exit_key) if self.pending_hole_exit_key is not None else 'None'
+        self.get_logger().warn(
+            f'Direct goal-branch hole: entry={entry_msg}, exit={exit_msg}, '
+            f'score={branch_score:.3f}, hole_samples={len(self.latest_hole_samples)}, '
+            f'repair_points={len(self.latest_hole_repair_path)}.'
+        )
+
+    def detect_holes_after_next_goal(
+        self,
+        current_key: NodeKey,
+        next_goal_key: Optional[NodeKey],
+        robot_xy: Tuple[float, float]
+    ) -> None:
+        """
+        Branch-seed 验证版 hole detection。
+
+        本版故意删去 doorway gap predictor 和普通 seed 兜底：
+        1. 先判断当前是否处于 boundary_lap 正常前进；
+        2. 在当前 boundary_lap 前方寻找“向 hole 内部延伸的侧向 RCG 分支边”；
+        3. 只用分支边另一端的 open sample 作为 floodfill seed；
+        4. boundary_key 可以是 closed sample；
+        5. entry 优先使用 branch seed，exit 固定在 boundary_lap 上。
+        """
+        self.latest_hole_components = []
+        self.latest_hole_infos = []
+        self.latest_hole_samples = []
+        self.latest_hole_repair_path = []
+        self.pending_hole_entry_key = None
+        self.pending_hole_exit_key = None
+        self.pending_branch_trigger_goal_key = None
+        self.pending_branch_trigger_seed_key = None
+        self.pending_branch_trigger_boundary_key = None
+        self.pending_branch_trigger_score = 0.0
+
+        if not self.enable_hole_detection:
+            return
+
+        if current_key not in self.nodes:
+            return
+
+        if next_goal_key is None or next_goal_key not in self.nodes:
+            return
+
+        if self.hole_disable_during_escape and self.escape_active:
+            return
+
+        if self.hole_enable_boundary_lap_gate:
+            if not self.is_current_lap_near_buffer(current_key, next_goal_key):
+                return
+
+        branch_pairs = self.collect_branch_hole_seed_pairs(
+            current_key,
+            next_goal_key,
+            robot_xy
+        )
+
+        if not branch_pairs:
+            return
+
+        candidate_holes: List[Tuple[
+            float,
+            Set[NodeKey],
+            Tuple[float, float, int, float, float, float, str],
+            Optional[NodeKey],
+            Optional[NodeKey]
+        ]] = []
+
+        visited: Set[NodeKey] = set()
+        seen_components: Set[frozenset] = set()
+
+        for seed_key, boundary_key, branch_score in branch_pairs:
+            if seed_key not in self.nodes:
                 continue
 
-            comp = self.floodfill_open_component(seed, next_goal_key, visited)
+            if seed_key in visited:
+                continue
 
+            comp = self.floodfill_open_component(seed_key, next_goal_key, visited)
             if not comp:
                 continue
 
-            # 主干道保护：如果 next_goal 仍在当前 lap 上，
-            # 当前 lap 附近的 open component 很可能是马上会被普通牛耕清扫的区域，
-            # 不应该提前标记为 hole。
+            comp_id = frozenset(comp)
+            if comp_id in seen_components:
+                continue
+            seen_components.add(comp_id)
+
             if self.should_protect_component_as_main_sweep(comp, current_key, next_goal_key):
                 continue
 
-            if not self.component_passes_local_hole_gate(
-                comp,
-                current_key,
-                next_goal_key,
-                robot_xy
-            ):
+            if not self.component_passes_local_hole_gate(comp, current_key, next_goal_key, robot_xy):
                 continue
 
             ok, info = self.validate_hole_component(comp, robot_xy)
-
             if not ok or info is None:
                 continue
 
-            score = self.component_local_hole_score(
+            if seed_key in comp and seed_key in self.nodes:
+                entry_key = seed_key
+            else:
+                # 理论上 seed 会在 comp 内；这里只做防御性兜底，仍不使用普通 seed。
+                entry_key = self.nearest_component_key_to_xy(comp, robot_xy)
+
+            exit_key = self.select_branch_exit_key_for_component(
                 comp,
                 current_key,
                 next_goal_key,
-                robot_xy
+                robot_xy,
+                boundary_key
             )
-            candidate_holes.append((score, comp, info))
+
+            score = (
+                branch_score +
+                0.35 * self.component_local_hole_score(comp, current_key, next_goal_key, robot_xy)
+            )
+
+            candidate_holes.append((score, comp, info, entry_key, exit_key))
 
         candidate_holes.sort(key=lambda item: item[0])
         keep_n = max(1, self.hole_keep_nearest_components)
         candidate_holes = candidate_holes[:keep_n]
 
-        hole_components = [item[1] for item in candidate_holes]
-        hole_infos = [item[2] for item in candidate_holes]
+        if not candidate_holes:
+            return
 
-        self.latest_hole_components = hole_components
-        self.latest_hole_infos = hole_infos
-        # 新逻辑：不再做 dense hole resampling。
-        # /cstar/hole_samples 直接显示当前 active hole 内的 RCG open nodes。
-        self.latest_hole_samples = []
-        self.build_hole_repair_path(current_key, robot_xy, next_goal_key)
+        self.latest_hole_components = [item[1] for item in candidate_holes]
+        self.latest_hole_infos = [item[2] for item in candidate_holes]
 
-        if hole_infos:
+        self.pending_hole_entry_key = candidate_holes[0][3]
+        self.pending_hole_exit_key = candidate_holes[0][4]
+
+        if self.pending_hole_entry_key in self.nodes and self.pending_hole_exit_key in self.nodes:
+            self.build_hole_repair_path(current_key, robot_xy, next_goal_key)
+
+        if self.latest_hole_infos:
+            entry_msg = str(self.pending_hole_entry_key) if self.pending_hole_entry_key is not None else 'None'
+            exit_msg = str(self.pending_hole_exit_key) if self.pending_hole_exit_key is not None else 'None'
             self.get_logger().warn(
-                f'RCG hole detection: detected {len(hole_infos)} potential hole component(s), '
+                f'Branch-seed hole detection: detected {len(self.latest_hole_infos)} component(s), '
+                f'branch_pairs={len(branch_pairs)}, '
+                f'entry={entry_msg}, exit={exit_msg}, '
                 f'hole_samples={len(self.latest_hole_samples)}, '
                 f'repair_points={len(self.latest_hole_repair_path)}.'
             )
@@ -2517,24 +3027,24 @@ class CStarWaypointPlannerNode(Node):
         """
         选择 repair start/end。
 
-        默认优先使用 boundary-lap entry/exit：
-        start/end 固定在正常 C* boundary lap 上，避免跑到 hole 内部。
-        如果 boundary lap 候选失败，再退回旧的 doorway-in-component 兜底逻辑。
+        工程稳定版：
+        - 默认只允许 entry / exit 落在当前 boundary_lap 上；
+        - 不再从 hole component 内部兜底选择 entry/exit，避免 start/end 跑进 hole；
+        - 如果 boundary_lap 上无法选出合理 start/end，则本轮只显示 hole，
+          不生成 repair path。
         """
         if not comp:
             return None, None
 
         if self.hole_entry_exit_on_boundary_lap:
-            entry_key, exit_key = self.select_boundary_lap_entry_exit_keys_for_hole(
+            return self.select_boundary_lap_entry_exit_keys_for_hole(
                 comp,
                 current_key,
                 robot_xy,
                 next_goal_key
             )
-            if entry_key is not None and exit_key is not None:
-                return entry_key, exit_key
 
-        # 兜底：保留旧逻辑，避免极端地图下完全没有 entry/exit。
+        # 只有显式关闭 boundary-lap entry/exit 时，才使用旧的 component 内部兜底逻辑。
         u, v, origin, seg_len = self.get_main_sweep_basis(
             current_key,
             next_goal_key,
@@ -2553,8 +3063,7 @@ class CStarWaypointPlannerNode(Node):
             s_coord, t_coord = self.project_in_sweep_frame(x, y, origin, u, v)
             lateral = abs(t_coord)
             metrics.append((s_coord, lateral, math.hypot(x - robot_xy[0], y - robot_xy[1]), key))
-            if lateral < min_lateral:
-                min_lateral = lateral
+            min_lateral = min(min_lateral, lateral)
 
         if len(metrics) < 2:
             return None, None
@@ -2563,7 +3072,7 @@ class CStarWaypointPlannerNode(Node):
         doorway: List[Tuple[float, float, float, NodeKey]] = []
 
         for item in metrics:
-            s_coord, lateral, robot_dist, key = item
+            s_coord, lateral, _, _ = item
             in_lateral_band = lateral <= min_lateral + band_width
             in_forward_window = (
                 s_coord >= -self.hole_local_backward_extension and
@@ -3059,11 +3568,11 @@ class CStarWaypointPlannerNode(Node):
         next_goal_key: Optional[NodeKey]
     ) -> None:
         """
-        Doorway-constrained orthogonal hole repair path。
+        Branch-seed constrained orthogonal hole repair path。
 
         新逻辑：
         1. hole detection 仍使用当前稳定的 RCG-based floodfill；
-        2. entry/exit 仍从靠近当前 C* 主路径的 doorway nodes 中选择；
+        2. entry 优先使用 branch seed，exit 固定在 boundary_lap 上；
         3. hole 内部不再用普通 repair/最近邻，也不只用稀疏 RCG nodes；
         4. 在 hole 内部按“垂直于当前 C* 主方向”的平行 lap 加密重采样；
         5. 自动尝试不同 offset 和奇偶 lap 数，优先生成从 entry 进、从 exit 出的牛耕路径；
@@ -3118,9 +3627,17 @@ class CStarWaypointPlannerNode(Node):
             if center_shift <= self.hole_active_match_distance:
                 use_locked_entry_exit = True
 
+        pending_entry_key = self.pending_hole_entry_key
+        pending_exit_key = self.pending_hole_exit_key
+
         if use_locked_entry_exit:
             entry_key = previous_entry_key
             exit_key = previous_exit_key
+        elif pending_entry_key in self.nodes and pending_exit_key in self.nodes:
+            # branch seed 当前帧给出的 entry/exit 优先级最高。
+            # 初次检测时用它们锁定 start/end；同一 active hole 后续动态更新时不再漂移。
+            entry_key = pending_entry_key
+            exit_key = pending_exit_key
         else:
             entry_key, exit_key = self.select_entry_exit_keys_for_hole(
                 comp,
@@ -3940,6 +4457,8 @@ class CStarWaypointPlannerNode(Node):
         self.active_hole_exit = None
         self.active_hole_entry_key = None
         self.active_hole_exit_key = None
+        self.pending_hole_entry_key = None
+        self.pending_hole_exit_key = None
 
     def publish_hole_visuals(self) -> None:
         self.publish_hole_nodes()
@@ -4027,14 +4546,9 @@ class CStarWaypointPlannerNode(Node):
         if current_goal_is_lap_switch:
             self.clear_hole_visual_state()
 
-        # 只有沿同一条 lap 正常行进时，才允许动态更新 hole repair 可视化。
-        if (
-            not reached_goal and
-            not current_goal_is_lap_switch and
-            self.should_update_hole_during_motion() and
-            self.current_goal_key is not None
-        ):
-            self.detect_holes_after_next_goal(current_key, self.current_goal_key, robot_xy)
+        # 本版采用“预判 -> 到达后执行”的 branch-trigger 逻辑。
+        # 行进途中不再重新触发新的 hole floodfill，避免还没到 boundary_key 就提前生成 repair。
+        # 后续如果需要动态更新 repair path，可以只在 latest_hole_components 已存在时单独刷新。
 
         if reached_goal:
             if self.current_goal_key is not None:
@@ -4049,23 +4563,35 @@ class CStarWaypointPlannerNode(Node):
             if normal_goal is not None:
                 self.last_deadend_key = None
 
-                # 先判断这一步是不是不同 lap 之间的换行/过渡。
-                next_goal_is_lap_switch = self.is_lap_switch_goal(current_key, normal_goal)
-
                 # 先锁定正常 C* goal，保证 goal_marker 的选择不被 hole detection 干扰。
                 self.set_new_goal(normal_goal, 'C* normal')
 
-                # 第一次只生成第一个 goal，不检测 hole。
-                # 小车到达第一个 goal 后，前往第二个 goal 时才开始第一次 hole detection。
-                # 如果这一步是不同 lap 的切换，则不检测 hole，也不生成 repair path。
-                if (
-                    reached_from_existing_goal and
-                    not was_escape_active and
-                    not next_goal_is_lap_switch
-                ):
+                next_goal_is_lap_switch = self.is_lap_switch_goal(current_key, normal_goal)
+
+                # 新触发条件：只要刚选出来的 goal_marker 本身就是 boundary_key，
+                # 就立即从对应 branch seed 做 floodfill / repair。
+                # 不再缓存到“到达该 goal_marker 后”才执行。
+                self.clear_pending_branch_trigger()
+                direct_trigger = None
+                if not was_escape_active and not next_goal_is_lap_switch:
+                    direct_trigger = self.find_branch_trigger_for_goal(
+                        current_key,
+                        normal_goal,
+                        robot_xy
+                    )
+
+                if direct_trigger is not None:
+                    seed_key, boundary_key, branch_score = direct_trigger
                     self.hole_detection_armed = True
                     self.last_hole_dynamic_update_time = self.get_clock().now()
-                    self.detect_holes_after_next_goal(current_key, normal_goal, robot_xy)
+                    self.detect_hole_from_goal_branch_trigger(
+                        current_key,
+                        normal_goal,
+                        robot_xy,
+                        seed_key,
+                        boundary_key,
+                        branch_score
+                    )
                 else:
                     self.clear_hole_visual_state()
 
@@ -4118,4 +4644,1813 @@ def main(args=None) -> None:
 
 if __name__ == '__main__':
     main()
-#更改了hole检测的逻辑，entry/exit还是不合理版本。
+
+
+# ------------------------------------------------------------------------------------------
+
+#!/usr/bin/env python3
+"""
+CStar waypoint planner for the Dense-RCG + Sparse-Backbone framework.
+
+Design:
+1. The robot follows only the sparse backbone graph:
+   /cstar/rcg_nodes_backbone
+   /cstar/rcg_markers_backbone
+
+2. The dense graph is used only for topology analysis and hole detection:
+   /cstar/rcg_nodes_dense
+   /cstar/rcg_markers_dense
+
+3. Old boundary-lap / doorway-gap / static-branch logic has been removed.
+   Branch edges are detected dynamically in the planner from the robot's
+   current local backbone window:
+   local backbone node -> off-backbone dense seed -> floodfill dense component
+   -> classify as hole / frontier / normal-lap.
+"""
+
+import math
+from collections import deque
+from typing import Dict, List, Optional, Set, Tuple
+
+import numpy as np
+import rclpy
+from rclpy.duration import Duration
+from rclpy.node import Node
+from rclpy.time import Time
+
+from geometry_msgs.msg import Point, Pose, PoseArray, PoseStamped
+from nav_msgs.msg import OccupancyGrid, Path
+from visualization_msgs.msg import Marker, MarkerArray
+
+from tf2_ros import Buffer, ConnectivityException, ExtrapolationException, LookupException, TransformListener
+
+
+NodeKey = Tuple[int, int]
+GridCell = Tuple[int, int]
+
+
+class CStarWaypointPlannerNode(Node):
+    def __init__(self) -> None:
+        super().__init__('cstar_waypoint_planner_node')
+
+        # ========== Input graph topics ==========
+        self.declare_parameter('backbone_nodes_topic', '/cstar/rcg_nodes_backbone')
+        self.declare_parameter('backbone_markers_topic', '/cstar/rcg_markers_backbone')
+        self.declare_parameter('dense_nodes_topic', '/cstar/rcg_nodes_dense')
+        self.declare_parameter('dense_markers_topic', '/cstar/rcg_markers_dense')
+
+        # ========== Map topics ==========
+        self.declare_parameter('covered_map_topic', '/cstar/covered_map')
+        self.declare_parameter('free_map_topic', '/cstar/free_map')
+        self.declare_parameter('obstacle_map_topic', '/cstar/obstacle_map')
+        self.declare_parameter('unknown_map_topic', '/cstar/unknown_map')
+
+        # ========== Frames / timing ==========
+        self.declare_parameter('map_frame', 'map')
+        self.declare_parameter('base_frame', 'base_footprint')
+        self.declare_parameter('update_period', 0.5)
+        self.declare_parameter('position_quantization', 0.05)
+
+        # ========== Goal following ==========
+        self.declare_parameter('snap_distance', 0.50)
+        self.declare_parameter('goal_center_tolerance', 0.10)
+        self.declare_parameter('closed_position_radius', 0.12)
+        self.declare_parameter('covered_close_threshold', 50)
+        self.declare_parameter('use_covered_map_for_closing', True)
+
+        # Backbone boustrophedon selection.
+        self.declare_parameter('initial_sweep_direction', -1.0)
+        self.declare_parameter('same_lap_y_tolerance', 0.14)
+        self.declare_parameter('same_col_x_tolerance', 0.16)
+        self.declare_parameter('allow_diagonal_fallback', True)
+
+        # When no open neighbor exists, the planner moves along the backbone graph
+        # toward the nearest still-open backbone node.
+        self.declare_parameter('enable_graph_transit_to_open', True)
+        self.declare_parameter('max_graph_transit_hops', 200)
+
+        # ========== Dense off-backbone hole detection ==========
+        self.declare_parameter('enable_hole_detection', True)
+        self.declare_parameter('hole_scan_lookahead_distance', 1.30)
+        self.declare_parameter('hole_scan_backtrack_margin', 0.10)
+        self.declare_parameter('hole_dynamic_update_period', 0.5)
+        # Dynamic branch detection is local to the robot's current backbone corridor.
+        self.declare_parameter('local_backbone_window_lateral_radius', 0.38)
+        self.declare_parameter('branch_edge_max_distance', 0.75)
+        self.declare_parameter('branch_lateral_min_distance', 0.14)
+        self.declare_parameter('branch_lateral_ratio', 1.20)
+        self.declare_parameter('branch_seed_min_distance_to_window', 0.12)
+        self.declare_parameter('publish_nonhole_branch_candidates', True)
+
+        # Candidate component filters.
+        self.declare_parameter('hole_min_nodes', 4)
+        self.declare_parameter('hole_max_nodes', 220)
+        self.declare_parameter('hole_min_bbox_area', 0.04)
+        self.declare_parameter('hole_max_bbox_area', 8.00)
+        self.declare_parameter('hole_max_robot_distance', 2.00)
+
+        # If a dense component is very close to the backbone line, it is usually
+        # just skipped dense samples between sparse backbone nodes, not a hole.
+        self.declare_parameter('normal_lap_distance_to_backbone', 0.13)
+        self.declare_parameter('hole_min_max_distance_to_backbone', 0.18)
+
+        # If an off-backbone component has many independent contacts with the
+        # backbone, it is more likely a normal dense region than a local hole.
+        self.declare_parameter('normal_lap_attachment_threshold', 4)
+
+        # Unknown/frontier rejection.
+        self.declare_parameter('unknown_check_radius', 0.25)
+        self.declare_parameter('unknown_reject_ratio', 0.35)
+
+        # Floodfill safety cap.
+        self.declare_parameter('dense_floodfill_max_nodes', 600)
+
+        # Local repair path visualization over the accepted hole component.
+        self.declare_parameter('enable_hole_repair_path', True)
+        self.declare_parameter('hole_repair_lap_tolerance', 0.18)
+        self.declare_parameter('hole_repair_max_points', 360)
+
+        # ========== Read parameters ==========
+        self.backbone_nodes_topic = self.get_parameter('backbone_nodes_topic').value
+        self.backbone_markers_topic = self.get_parameter('backbone_markers_topic').value
+        self.dense_nodes_topic = self.get_parameter('dense_nodes_topic').value
+        self.dense_markers_topic = self.get_parameter('dense_markers_topic').value
+
+        self.covered_map_topic = self.get_parameter('covered_map_topic').value
+        self.free_map_topic = self.get_parameter('free_map_topic').value
+        self.obstacle_map_topic = self.get_parameter('obstacle_map_topic').value
+        self.unknown_map_topic = self.get_parameter('unknown_map_topic').value
+
+        self.map_frame = self.get_parameter('map_frame').value
+        self.base_frame = self.get_parameter('base_frame').value
+        self.update_period = float(self.get_parameter('update_period').value)
+        self.position_quantization = float(self.get_parameter('position_quantization').value)
+
+        self.snap_distance = float(self.get_parameter('snap_distance').value)
+        self.goal_center_tolerance = float(self.get_parameter('goal_center_tolerance').value)
+        self.closed_position_radius = float(self.get_parameter('closed_position_radius').value)
+        self.covered_close_threshold = int(self.get_parameter('covered_close_threshold').value)
+        self.use_covered_map_for_closing = bool(self.get_parameter('use_covered_map_for_closing').value)
+
+        initial_sweep = float(self.get_parameter('initial_sweep_direction').value)
+        self.sweep_dir = -1.0 if initial_sweep < 0.0 else 1.0
+        self.same_lap_y_tolerance = float(self.get_parameter('same_lap_y_tolerance').value)
+        self.same_col_x_tolerance = float(self.get_parameter('same_col_x_tolerance').value)
+        self.allow_diagonal_fallback = bool(self.get_parameter('allow_diagonal_fallback').value)
+
+        self.enable_graph_transit_to_open = bool(self.get_parameter('enable_graph_transit_to_open').value)
+        self.max_graph_transit_hops = int(self.get_parameter('max_graph_transit_hops').value)
+
+        self.enable_hole_detection = bool(self.get_parameter('enable_hole_detection').value)
+        self.hole_scan_lookahead_distance = float(self.get_parameter('hole_scan_lookahead_distance').value)
+        self.hole_scan_backtrack_margin = float(self.get_parameter('hole_scan_backtrack_margin').value)
+        self.hole_dynamic_update_period = float(self.get_parameter('hole_dynamic_update_period').value)
+        self.local_backbone_window_lateral_radius = float(
+            self.get_parameter('local_backbone_window_lateral_radius').value
+        )
+        self.branch_edge_max_distance = float(self.get_parameter('branch_edge_max_distance').value)
+        self.branch_lateral_min_distance = float(
+            self.get_parameter('branch_lateral_min_distance').value
+        )
+        self.branch_lateral_ratio = float(self.get_parameter('branch_lateral_ratio').value)
+        self.branch_seed_min_distance_to_window = float(
+            self.get_parameter('branch_seed_min_distance_to_window').value
+        )
+        self.publish_nonhole_branch_candidates = bool(
+            self.get_parameter('publish_nonhole_branch_candidates').value
+        )
+
+        self.hole_min_nodes = int(self.get_parameter('hole_min_nodes').value)
+        self.hole_max_nodes = int(self.get_parameter('hole_max_nodes').value)
+        self.hole_min_bbox_area = float(self.get_parameter('hole_min_bbox_area').value)
+        self.hole_max_bbox_area = float(self.get_parameter('hole_max_bbox_area').value)
+        self.hole_max_robot_distance = float(self.get_parameter('hole_max_robot_distance').value)
+
+        self.normal_lap_distance_to_backbone = float(
+            self.get_parameter('normal_lap_distance_to_backbone').value
+        )
+        self.hole_min_max_distance_to_backbone = float(
+            self.get_parameter('hole_min_max_distance_to_backbone').value
+        )
+        self.normal_lap_attachment_threshold = int(
+            self.get_parameter('normal_lap_attachment_threshold').value
+        )
+
+        self.unknown_check_radius = float(self.get_parameter('unknown_check_radius').value)
+        self.unknown_reject_ratio = float(self.get_parameter('unknown_reject_ratio').value)
+        self.dense_floodfill_max_nodes = int(self.get_parameter('dense_floodfill_max_nodes').value)
+
+        self.enable_hole_repair_path = bool(self.get_parameter('enable_hole_repair_path').value)
+        self.hole_repair_lap_tolerance = float(self.get_parameter('hole_repair_lap_tolerance').value)
+        self.hole_repair_max_points = int(self.get_parameter('hole_repair_max_points').value)
+
+        # ========== Graph state ==========
+        self.backbone_nodes: Dict[NodeKey, Tuple[float, float]] = {}
+        self.backbone_raw_edges: List[Tuple[NodeKey, NodeKey]] = []
+        self.backbone_adj: Dict[NodeKey, Set[NodeKey]] = {}
+
+        self.dense_nodes: Dict[NodeKey, Tuple[float, float]] = {}
+        self.dense_raw_edges: List[Tuple[NodeKey, NodeKey]] = []
+        self.dense_adj: Dict[NodeKey, Set[NodeKey]] = {}
+
+        # Backbone keys that also exist in dense graph. These are barriers for
+        # dense off-backbone floodfill.
+        self.backbone_keys_in_dense: Set[NodeKey] = set()
+
+        # ========== Coverage / motion state ==========
+        self.closed_backbone_nodes: Set[NodeKey] = set()
+        self.closed_positions: List[Tuple[float, float]] = []
+        self.current_goal_key: Optional[NodeKey] = None
+        self.selected_path: List[Tuple[float, float]] = []
+
+        # Hole visualization state.
+        self.latest_hole_component: Set[NodeKey] = set()
+        self.latest_hole_attachments: Set[NodeKey] = set()
+        self.latest_hole_entry_key: Optional[NodeKey] = None
+        self.latest_hole_exit_key: Optional[NodeKey] = None
+        self.latest_hole_repair_path: List[Tuple[float, float]] = []
+        self.latest_branch_edge: Optional[Tuple[NodeKey, NodeKey]] = None
+        self.latest_dynamic_branch_edges: List[Tuple[NodeKey, NodeKey, str]] = []
+        self.latest_backbone_window: Set[NodeKey] = set()
+        self.last_hole_update_time = None
+
+        # Maps.
+        self.covered_map: Optional[OccupancyGrid] = None
+        self.covered_data: Optional[List[int]] = None
+        self.free_msg: Optional[OccupancyGrid] = None
+        self.obstacle_msg: Optional[OccupancyGrid] = None
+        self.unknown_msg: Optional[OccupancyGrid] = None
+        self.free_arr: Optional[np.ndarray] = None
+        self.obstacle_arr: Optional[np.ndarray] = None
+        self.unknown_arr: Optional[np.ndarray] = None
+
+        # TF.
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+
+        # ========== Subscriptions ==========
+        self.create_subscription(PoseArray, self.backbone_nodes_topic, self.backbone_nodes_callback, 10)
+        self.create_subscription(MarkerArray, self.backbone_markers_topic, self.backbone_markers_callback, 10)
+        self.create_subscription(PoseArray, self.dense_nodes_topic, self.dense_nodes_callback, 10)
+        self.create_subscription(MarkerArray, self.dense_markers_topic, self.dense_markers_callback, 10)
+
+        self.create_subscription(OccupancyGrid, self.covered_map_topic, self.covered_callback, 10)
+        self.create_subscription(OccupancyGrid, self.free_map_topic, self.free_callback, 10)
+        self.create_subscription(OccupancyGrid, self.obstacle_map_topic, self.obstacle_callback, 10)
+        self.create_subscription(OccupancyGrid, self.unknown_map_topic, self.unknown_callback, 10)
+
+        # ========== Publishers ==========
+        self.goal_pub = self.create_publisher(PoseStamped, '/cstar/goal', 10)
+        self.goal_marker_pub = self.create_publisher(Marker, '/cstar/goal_marker', 10)
+        self.state_marker_pub = self.create_publisher(MarkerArray, '/cstar/open_closed_markers', 10)
+        self.path_pub = self.create_publisher(Path, '/cstar/selected_path', 10)
+
+        self.hole_nodes_pub = self.create_publisher(PoseArray, '/cstar/hole_nodes', 10)
+        self.hole_markers_pub = self.create_publisher(MarkerArray, '/cstar/hole_markers', 10)
+        self.hole_entry_marker_pub = self.create_publisher(MarkerArray, '/cstar/hole_entry_marker', 10)
+        self.hole_exit_marker_pub = self.create_publisher(MarkerArray, '/cstar/hole_exit_marker', 10)
+        self.hole_repair_path_pub = self.create_publisher(Path, '/cstar/hole_repair_path', 10)
+        self.hole_repair_markers_pub = self.create_publisher(MarkerArray, '/cstar/hole_repair_markers', 10)
+        self.dynamic_branch_marker_pub = self.create_publisher(
+            MarkerArray, '/cstar/dynamic_branch_markers', 10
+        )
+
+        self.timer = self.create_timer(self.update_period, self.on_timer)
+
+        self.get_logger().info('CStarWaypointPlannerNode dense/backbone mode started.')
+        self.get_logger().info(f'backbone_nodes_topic={self.backbone_nodes_topic}')
+        self.get_logger().info(f'backbone_markers_topic={self.backbone_markers_topic}')
+        self.get_logger().info(f'dense_nodes_topic={self.dense_nodes_topic}')
+        self.get_logger().info(f'dense_markers_topic={self.dense_markers_topic}')
+        self.get_logger().info(
+            f'hole_detection={self.enable_hole_detection}, '
+            f'lookahead={self.hole_scan_lookahead_distance:.2f}, '
+            f'lateral_radius={self.local_backbone_window_lateral_radius:.2f}, '
+            f'branch_lateral_min={self.branch_lateral_min_distance:.2f}, '
+            f'min_nodes={self.hole_min_nodes}, max_nodes={self.hole_max_nodes}'
+        )
+
+    # ------------------------------------------------------------------
+    # Basic graph / map callbacks
+    # ------------------------------------------------------------------
+    def make_key(self, x: float, y: float) -> NodeKey:
+        q = self.position_quantization
+        return int(round(x / q)), int(round(y / q))
+
+    def backbone_nodes_callback(self, msg: PoseArray) -> None:
+        nodes: Dict[NodeKey, Tuple[float, float]] = {}
+        for pose in msg.poses:
+            x = pose.position.x
+            y = pose.position.y
+            nodes[self.make_key(x, y)] = (x, y)
+
+        self.backbone_nodes = nodes
+        self.rebuild_backbone_adjacency()
+        self.refresh_backbone_keys_in_dense()
+
+        if self.current_goal_key is not None and self.current_goal_key not in self.backbone_nodes:
+            self.current_goal_key = None
+            self.selected_path.clear()
+
+    def backbone_markers_callback(self, msg: MarkerArray) -> None:
+        self.backbone_raw_edges = self.extract_edges_from_marker_array(msg)
+        self.rebuild_backbone_adjacency()
+
+    def dense_nodes_callback(self, msg: PoseArray) -> None:
+        nodes: Dict[NodeKey, Tuple[float, float]] = {}
+        for pose in msg.poses:
+            x = pose.position.x
+            y = pose.position.y
+            nodes[self.make_key(x, y)] = (x, y)
+
+        self.dense_nodes = nodes
+        self.rebuild_dense_adjacency()
+        self.refresh_backbone_keys_in_dense()
+
+    def dense_markers_callback(self, msg: MarkerArray) -> None:
+        self.dense_raw_edges = self.extract_edges_from_marker_array(msg)
+        self.rebuild_dense_adjacency()
+
+    def extract_edges_from_marker_array(self, msg: MarkerArray) -> List[Tuple[NodeKey, NodeKey]]:
+        edges: List[Tuple[NodeKey, NodeKey]] = []
+
+        for marker in msg.markers:
+            if marker.ns != 'rcg_edges':
+                continue
+
+            pts = marker.points
+            if len(pts) < 2:
+                continue
+
+            for i in range(0, len(pts) - 1, 2):
+                p1 = pts[i]
+                p2 = pts[i + 1]
+                k1 = self.make_key(p1.x, p1.y)
+                k2 = self.make_key(p2.x, p2.y)
+                if k1 != k2:
+                    edges.append((k1, k2))
+
+        return edges
+
+    def rebuild_backbone_adjacency(self) -> None:
+        adj: Dict[NodeKey, Set[NodeKey]] = {key: set() for key in self.backbone_nodes.keys()}
+
+        for k1, k2 in self.backbone_raw_edges:
+            if k1 not in self.backbone_nodes or k2 not in self.backbone_nodes:
+                continue
+            adj[k1].add(k2)
+            adj[k2].add(k1)
+
+        self.backbone_adj = adj
+
+    def rebuild_dense_adjacency(self) -> None:
+        adj: Dict[NodeKey, Set[NodeKey]] = {key: set() for key in self.dense_nodes.keys()}
+
+        for k1, k2 in self.dense_raw_edges:
+            if k1 not in self.dense_nodes or k2 not in self.dense_nodes:
+                continue
+            adj[k1].add(k2)
+            adj[k2].add(k1)
+
+        self.dense_adj = adj
+
+    def refresh_backbone_keys_in_dense(self) -> None:
+        self.backbone_keys_in_dense = {
+            key for key in self.backbone_nodes.keys()
+            if key in self.dense_nodes
+        }
+
+    def covered_callback(self, msg: OccupancyGrid) -> None:
+        self.covered_map = msg
+        self.covered_data = list(msg.data)
+
+    def free_callback(self, msg: OccupancyGrid) -> None:
+        self.free_msg = msg
+        h = msg.info.height
+        w = msg.info.width
+        self.free_arr = np.asarray(msg.data, dtype=np.int16).reshape((h, w)) > 50
+
+    def obstacle_callback(self, msg: OccupancyGrid) -> None:
+        self.obstacle_msg = msg
+        h = msg.info.height
+        w = msg.info.width
+        self.obstacle_arr = np.asarray(msg.data, dtype=np.int16).reshape((h, w)) > 50
+
+    def unknown_callback(self, msg: OccupancyGrid) -> None:
+        self.unknown_msg = msg
+        h = msg.info.height
+        w = msg.info.width
+        self.unknown_arr = np.asarray(msg.data, dtype=np.int16).reshape((h, w)) > 50
+
+    # ------------------------------------------------------------------
+    # Pose / closed-state helpers
+    # ------------------------------------------------------------------
+    def get_robot_pose(self) -> Optional[Tuple[float, float]]:
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                self.map_frame,
+                self.base_frame,
+                Time(),
+                timeout=Duration(seconds=0.1),
+            )
+            return tf.transform.translation.x, tf.transform.translation.y
+        except (LookupException, ConnectivityException, ExtrapolationException):
+            return None
+
+    def world_to_covered_cell(self, x: float, y: float) -> Optional[Tuple[int, int]]:
+        if self.covered_map is None:
+            return None
+
+        info = self.covered_map.info
+        mx = int((x - info.origin.position.x) / info.resolution)
+        my = int((y - info.origin.position.y) / info.resolution)
+
+        if mx < 0 or my < 0 or mx >= info.width or my >= info.height:
+            return None
+
+        return mx, my
+
+    def world_to_cell(self, x: float, y: float) -> Optional[GridCell]:
+        if self.free_msg is None:
+            return None
+
+        info = self.free_msg.info
+        col = int((x - info.origin.position.x) / info.resolution)
+        row = int((y - info.origin.position.y) / info.resolution)
+
+        if row < 0 or col < 0 or row >= info.height or col >= info.width:
+            return None
+
+        return row, col
+
+    def is_inside_covered_map(self, x: float, y: float) -> bool:
+        if not self.use_covered_map_for_closing:
+            return False
+
+        if self.covered_map is None or self.covered_data is None:
+            return False
+
+        cell = self.world_to_covered_cell(x, y)
+        if cell is None:
+            return False
+
+        mx, my = cell
+        idx = my * self.covered_map.info.width + mx
+
+        if idx < 0 or idx >= len(self.covered_data):
+            return False
+
+        return int(self.covered_data[idx]) >= self.covered_close_threshold
+
+    def add_closed_position(self, x: float, y: float) -> None:
+        if self.closed_positions:
+            lx, ly = self.closed_positions[-1]
+            if math.hypot(x - lx, y - ly) < 0.05:
+                return
+
+        self.closed_positions.append((x, y))
+        if len(self.closed_positions) > 5000:
+            self.closed_positions = self.closed_positions[-5000:]
+
+    def is_near_closed_position(
+        self,
+        x: float,
+        y: float,
+        radius: Optional[float] = None
+    ) -> bool:
+        r = self.closed_position_radius if radius is None else radius
+        r2 = r * r
+
+        for cx, cy in self.closed_positions:
+            dx = x - cx
+            dy = y - cy
+            if dx * dx + dy * dy <= r2:
+                return True
+
+        return False
+
+    def is_closed_backbone_key(self, key: NodeKey) -> bool:
+        if key in self.closed_backbone_nodes:
+            return True
+
+        if key not in self.backbone_nodes:
+            return False
+
+        x, y = self.backbone_nodes[key]
+        return self.is_inside_covered_map(x, y) or self.is_near_closed_position(x, y)
+
+    def is_closed_dense_key(self, key: NodeKey) -> bool:
+        if key not in self.dense_nodes:
+            return False
+
+        x, y = self.dense_nodes[key]
+        return self.is_inside_covered_map(x, y) or self.is_near_closed_position(x, y)
+
+    def close_backbone_key(self, key: NodeKey) -> None:
+        if key not in self.backbone_nodes:
+            return
+
+        self.closed_backbone_nodes.add(key)
+        x, y = self.backbone_nodes[key]
+        self.add_closed_position(x, y)
+
+    def nearest_backbone_key(self, x: float, y: float) -> Optional[NodeKey]:
+        best_key = None
+        best_dist = float('inf')
+
+        for key, pos in self.backbone_nodes.items():
+            d = math.hypot(pos[0] - x, pos[1] - y)
+            if d < best_dist:
+                best_dist = d
+                best_key = key
+
+        if best_dist > self.snap_distance:
+            return None
+
+        return best_key
+
+    def is_reached_goal(self, robot_xy: Tuple[float, float]) -> bool:
+        if self.current_goal_key is None:
+            return True
+
+        if self.current_goal_key not in self.backbone_nodes:
+            return True
+
+        gx, gy = self.backbone_nodes[self.current_goal_key]
+        return math.hypot(robot_xy[0] - gx, robot_xy[1] - gy) <= self.goal_center_tolerance
+
+    # ------------------------------------------------------------------
+    # Backbone coverage goal selection
+    # ------------------------------------------------------------------
+    def classify_open_backbone_neighbors(
+        self,
+        current_key: NodeKey
+    ) -> Dict[str, List[Tuple[float, NodeKey]]]:
+        result = {
+            'same_forward': [],
+            'same_backward': [],
+            'left': [],
+            'up': [],
+            'down': [],
+            'right': [],
+            'diagonal': [],
+        }
+
+        if current_key not in self.backbone_nodes:
+            return result
+
+        cx, cy = self.backbone_nodes[current_key]
+
+        for nb in self.backbone_adj.get(current_key, set()):
+            if nb not in self.backbone_nodes:
+                continue
+
+            if self.is_closed_backbone_key(nb):
+                continue
+
+            x, y = self.backbone_nodes[nb]
+            dx = x - cx
+            dy = y - cy
+            dist = math.hypot(dx, dy)
+
+            if dist < 1e-6:
+                continue
+
+            if abs(dy) <= self.same_lap_y_tolerance:
+                if dx * self.sweep_dir > 0.0:
+                    result['same_forward'].append((abs(dx), nb))
+                else:
+                    result['same_backward'].append((abs(dx), nb))
+                continue
+
+            if abs(dx) >= abs(dy):
+                if dx < 0.0:
+                    result['left'].append((dist, nb))
+                else:
+                    result['right'].append((dist, nb))
+            else:
+                if dy > 0.0:
+                    result['up'].append((dist, nb))
+                else:
+                    result['down'].append((dist, nb))
+
+        for key in result:
+            result[key].sort(key=lambda item: item[0])
+
+        return result
+
+    def choose_next_backbone_goal(self, current_key: NodeKey) -> Optional[NodeKey]:
+        candidates = self.classify_open_backbone_neighbors(current_key)
+
+        if candidates['same_forward']:
+            return candidates['same_forward'][0][1]
+
+        if candidates['same_backward']:
+            next_key = candidates['same_backward'][0][1]
+            if current_key in self.backbone_nodes and next_key in self.backbone_nodes:
+                cx, _ = self.backbone_nodes[current_key]
+                nx, _ = self.backbone_nodes[next_key]
+                self.sweep_dir = -1.0 if (nx - cx) < 0.0 else 1.0
+            return next_key
+
+        if candidates['left']:
+            self.sweep_dir = -1.0
+            return candidates['left'][0][1]
+
+        if candidates['up']:
+            self.sweep_dir *= -1.0
+            return candidates['up'][0][1]
+
+        if candidates['down']:
+            self.sweep_dir *= -1.0
+            return candidates['down'][0][1]
+
+        if candidates['right']:
+            self.sweep_dir = 1.0
+            return candidates['right'][0][1]
+
+        if self.allow_diagonal_fallback and candidates['diagonal']:
+            candidates['diagonal'].sort(key=lambda item: item[0])
+            return candidates['diagonal'][0][1]
+
+        return None
+
+    def shortest_path_to_nearest_open_backbone(
+        self,
+        start_key: NodeKey
+    ) -> List[NodeKey]:
+        if start_key not in self.backbone_nodes:
+            return []
+
+        q = deque([start_key])
+        prev: Dict[NodeKey, Optional[NodeKey]] = {start_key: None}
+        depth: Dict[NodeKey, int] = {start_key: 0}
+        target: Optional[NodeKey] = None
+
+        while q:
+            key = q.popleft()
+
+            if key != start_key and not self.is_closed_backbone_key(key):
+                target = key
+                break
+
+            if depth[key] >= self.max_graph_transit_hops:
+                continue
+
+            for nb in sorted(self.backbone_adj.get(key, set()), key=lambda k: self.backbone_nodes.get(k, (0.0, 0.0))):
+                if nb in prev:
+                    continue
+                if nb not in self.backbone_nodes:
+                    continue
+                prev[nb] = key
+                depth[nb] = depth[key] + 1
+                q.append(nb)
+
+        if target is None:
+            return []
+
+        path: List[NodeKey] = []
+        cur: Optional[NodeKey] = target
+        while cur is not None:
+            path.append(cur)
+            cur = prev.get(cur)
+        path.reverse()
+        return path
+
+    def set_new_goal(self, key: Optional[NodeKey], reason: str) -> None:
+        if key is None or key not in self.backbone_nodes:
+            self.current_goal_key = None
+            self.selected_path.clear()
+            return
+
+        self.current_goal_key = key
+        x, y = self.backbone_nodes[key]
+        self.selected_path = [(x, y)]
+        self.publish_goal(key)
+        self.get_logger().info(f'New backbone goal: {key}, reason={reason}')
+
+    def publish_goal(self, key: NodeKey) -> None:
+        if key not in self.backbone_nodes:
+            return
+
+        x, y = self.backbone_nodes[key]
+
+        msg = PoseStamped()
+        msg.header.frame_id = self.map_frame
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.pose.position.x = x
+        msg.pose.position.y = y
+        msg.pose.position.z = 0.0
+        msg.pose.orientation.w = 1.0
+        self.goal_pub.publish(msg)
+
+        marker = Marker()
+        marker.header.frame_id = self.map_frame
+        marker.header.stamp = msg.header.stamp
+        marker.ns = 'cstar_goal'
+        marker.id = 0
+        marker.type = Marker.SPHERE
+        marker.action = Marker.ADD
+        marker.pose.position.x = x
+        marker.pose.position.y = y
+        marker.pose.position.z = 0.10
+        marker.pose.orientation.w = 1.0
+        marker.scale.x = 0.18
+        marker.scale.y = 0.18
+        marker.scale.z = 0.18
+        marker.color.r = 0.0
+        marker.color.g = 1.0
+        marker.color.b = 0.2
+        marker.color.a = 0.95
+        self.goal_marker_pub.publish(marker)
+
+    # ------------------------------------------------------------------
+    # Dense off-backbone hole detection
+    # ------------------------------------------------------------------
+    def should_update_hole_detection(self) -> bool:
+        if self.last_hole_update_time is None:
+            self.last_hole_update_time = self.get_clock().now()
+            return True
+
+        now = self.get_clock().now()
+        elapsed = (now - self.last_hole_update_time).nanoseconds / 1e9
+        if elapsed >= self.hole_dynamic_update_period:
+            self.last_hole_update_time = now
+            return True
+
+        return False
+
+    def get_backbone_scan_basis(
+        self,
+        current_key: NodeKey,
+        next_goal_key: Optional[NodeKey],
+    ) -> Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float]]:
+        """
+        Return local scan basis (u, v, origin). u is the current backbone
+        forward direction; v is the lateral direction. This makes branch
+        detection dynamic to the current robot/goal state instead of static
+        in the RCG node.
+        """
+        if current_key in self.backbone_nodes:
+            origin = self.backbone_nodes[current_key]
+        elif next_goal_key in self.backbone_nodes:
+            origin = self.backbone_nodes[next_goal_key]  # type: ignore[index]
+        else:
+            origin = (0.0, 0.0)
+
+        if (
+            current_key in self.backbone_nodes and
+            next_goal_key in self.backbone_nodes and
+            next_goal_key != current_key
+        ):
+            cx, cy = self.backbone_nodes[current_key]
+            gx, gy = self.backbone_nodes[next_goal_key]  # type: ignore[index]
+            dx = gx - cx
+            dy = gy - cy
+        else:
+            dx = self.sweep_dir
+            dy = 0.0
+
+        norm = math.hypot(dx, dy)
+        if norm < 1e-6:
+            u = (1.0 if self.sweep_dir >= 0.0 else -1.0, 0.0)
+        else:
+            u = (dx / norm, dy / norm)
+
+        v = (-u[1], u[0])
+        return u, v, origin
+
+    def project_to_basis(
+        self,
+        xy: Tuple[float, float],
+        origin: Tuple[float, float],
+        u: Tuple[float, float],
+        v: Tuple[float, float],
+    ) -> Tuple[float, float]:
+        dx = xy[0] - origin[0]
+        dy = xy[1] - origin[1]
+        return dx * u[0] + dy * u[1], dx * v[0] + dy * v[1]
+
+    def collect_backbone_window(
+        self,
+        current_key: NodeKey,
+        next_goal_key: Optional[NodeKey],
+        robot_xy: Tuple[float, float]
+    ) -> Set[NodeKey]:
+        """
+        Dynamic local backbone window.
+
+        This replaces the old global/static branch concept. Only backbone
+        nodes near the robot's current main corridor and within a forward
+        lookahead window are allowed to start branch search.
+        """
+        window: Set[NodeKey] = set()
+
+        if current_key not in self.backbone_nodes:
+            return window
+
+        u, v, origin = self.get_backbone_scan_basis(current_key, next_goal_key)
+        lookahead = max(0.10, self.hole_scan_lookahead_distance)
+        backtrack = max(0.0, self.hole_scan_backtrack_margin)
+        lateral_radius = max(0.05, self.local_backbone_window_lateral_radius)
+
+        # Graph search gives candidates; projection filtering turns it into a
+        # local forward corridor instead of a full global neighborhood.
+        q = deque([current_key])
+        dist_map: Dict[NodeKey, float] = {current_key: 0.0}
+        graph_limit = lookahead + backtrack + 1.0
+
+        while q:
+            key = q.popleft()
+            if key not in self.backbone_nodes:
+                continue
+
+            s, t = self.project_to_basis(self.backbone_nodes[key], origin, u, v)
+            if -backtrack <= s <= lookahead and abs(t) <= lateral_radius:
+                window.add(key)
+
+            kx, ky = self.backbone_nodes[key]
+            for nb in self.backbone_adj.get(key, set()):
+                if nb not in self.backbone_nodes:
+                    continue
+
+                nx, ny = self.backbone_nodes[nb]
+                step = math.hypot(nx - kx, ny - ky)
+                nd = dist_map[key] + step
+
+                if nd > graph_limit:
+                    continue
+
+                if nb in dist_map and nd >= dist_map[nb]:
+                    continue
+
+                # Do not expand very far away from the local corridor.
+                ns, nt = self.project_to_basis(self.backbone_nodes[nb], origin, u, v)
+                if ns < -backtrack - 0.60 or ns > lookahead + 0.60:
+                    continue
+                if abs(nt) > lateral_radius + 0.80:
+                    continue
+
+                dist_map[nb] = nd
+                q.append(nb)
+
+        if current_key in self.backbone_nodes:
+            window.add(current_key)
+        if next_goal_key in self.backbone_nodes:
+            window.add(next_goal_key)  # type: ignore[arg-type]
+
+        self.latest_backbone_window = set(window)
+        return window
+
+    def local_backbone_segments(
+        self,
+        window: Set[NodeKey]
+    ) -> List[Tuple[Tuple[float, float], Tuple[float, float]]]:
+        segs: List[Tuple[Tuple[float, float], Tuple[float, float]]] = []
+        for a in window:
+            if a not in self.backbone_nodes:
+                continue
+            for b in self.backbone_adj.get(a, set()):
+                if b not in window or b not in self.backbone_nodes:
+                    continue
+                if a > b:
+                    continue
+                segs.append((self.backbone_nodes[a], self.backbone_nodes[b]))
+        return segs
+
+    def min_distance_to_local_backbone(
+        self,
+        xy: Tuple[float, float],
+        window: Set[NodeKey]
+    ) -> float:
+        segs = self.local_backbone_segments(window)
+        if segs:
+            return min(self.point_to_segment_distance(xy, a, b) for a, b in segs)
+
+        best = float('inf')
+        for key in window:
+            if key not in self.backbone_nodes:
+                continue
+            bx, by = self.backbone_nodes[key]
+            best = min(best, math.hypot(xy[0] - bx, xy[1] - by))
+        return best if best != float('inf') else 0.0
+
+    def is_dynamic_branch_edge(
+        self,
+        base_key: NodeKey,
+        seed_key: NodeKey,
+        window: Set[NodeKey],
+        u: Tuple[float, float],
+        v: Tuple[float, float],
+    ) -> bool:
+        """
+        True branch edges are not static map attributes. They are dynamic
+        relations from the current local backbone corridor to an off-backbone
+        dense seed.
+        """
+        if base_key not in self.backbone_nodes or base_key not in self.dense_nodes:
+            return False
+        if seed_key not in self.dense_nodes:
+            return False
+        if seed_key in self.backbone_keys_in_dense:
+            return False
+        if self.is_closed_dense_key(seed_key):
+            return False
+
+        bx, by = self.dense_nodes[base_key]
+        sx, sy = self.dense_nodes[seed_key]
+        dx = sx - bx
+        dy = sy - by
+        edge_dist = math.hypot(dx, dy)
+
+        if edge_dist < 1e-6 or edge_dist > self.branch_edge_max_distance:
+            return False
+
+        edge_along = dx * u[0] + dy * u[1]
+        edge_lateral = abs(dx * v[0] + dy * v[1])
+
+        # Exclude dense samples that simply fill sparse gaps along the current
+        # backbone line. A dynamic branch should leave the local corridor.
+        if edge_lateral < self.branch_lateral_min_distance:
+            return False
+
+        if edge_lateral < self.branch_lateral_ratio * abs(edge_along):
+            return False
+
+        seed_dist_to_window = self.min_distance_to_local_backbone((sx, sy), window)
+        if seed_dist_to_window < self.branch_seed_min_distance_to_window:
+            return False
+
+        return True
+
+    def find_dense_branch_components(
+        self,
+        current_key: NodeKey,
+        next_goal_key: Optional[NodeKey],
+        robot_xy: Tuple[float, float]
+    ) -> List[Dict[str, object]]:
+        if not self.enable_hole_detection:
+            self.latest_dynamic_branch_edges = []
+            self.latest_backbone_window = set()
+            return []
+
+        if not self.dense_nodes or not self.dense_adj:
+            self.latest_dynamic_branch_edges = []
+            return []
+
+        if not self.backbone_nodes or not self.backbone_adj:
+            self.latest_dynamic_branch_edges = []
+            return []
+
+        window = self.collect_backbone_window(current_key, next_goal_key, robot_xy)
+        if not window:
+            self.latest_dynamic_branch_edges = []
+            return []
+
+        u, v, _ = self.get_backbone_scan_basis(current_key, next_goal_key)
+
+        candidates: List[Dict[str, object]] = []
+        seen_components: Set[frozenset] = set()
+        dynamic_edges: List[Tuple[NodeKey, NodeKey, str]] = []
+
+        for base_key in sorted(window):
+            if base_key not in self.dense_nodes:
+                continue
+
+            for seed_key in self.dense_adj.get(base_key, set()):
+                if not self.is_dynamic_branch_edge(base_key, seed_key, window, u, v):
+                    continue
+
+                comp, attachments = self.floodfill_dense_off_backbone(seed_key)
+                if not comp:
+                    continue
+
+                comp_id = frozenset(comp)
+                if comp_id in seen_components:
+                    continue
+                seen_components.add(comp_id)
+
+                label, reason, score = self.classify_off_backbone_component(
+                    comp=comp,
+                    attachments=attachments,
+                    seed_key=seed_key,
+                    base_key=base_key,
+                    robot_xy=robot_xy,
+                )
+
+                dynamic_edges.append((base_key, seed_key, label))
+                candidates.append({
+                    'label': label,
+                    'reason': reason,
+                    'score': score,
+                    'seed_key': seed_key,
+                    'base_key': base_key,
+                    'component': comp,
+                    'attachments': attachments,
+                })
+
+        self.latest_dynamic_branch_edges = dynamic_edges
+        candidates.sort(key=lambda item: float(item['score']))
+        return candidates
+
+    def floodfill_dense_off_backbone(
+        self,
+        seed_key: NodeKey
+    ) -> Tuple[Set[NodeKey], Set[NodeKey]]:
+        comp: Set[NodeKey] = set()
+        attachments: Set[NodeKey] = set()
+
+        if seed_key not in self.dense_nodes:
+            return comp, attachments
+
+        q = deque([seed_key])
+        visited: Set[NodeKey] = {seed_key}
+
+        while q:
+            key = q.popleft()
+
+            if len(comp) >= self.dense_floodfill_max_nodes:
+                break
+
+            if key in self.backbone_keys_in_dense:
+                attachments.add(key)
+                continue
+
+            if key not in self.dense_nodes:
+                continue
+
+            if self.is_closed_dense_key(key):
+                continue
+
+            comp.add(key)
+
+            for nb in self.dense_adj.get(key, set()):
+                if nb in visited:
+                    continue
+
+                visited.add(nb)
+
+                if nb in self.backbone_keys_in_dense:
+                    attachments.add(nb)
+                    continue
+
+                q.append(nb)
+
+        # A seed usually comes from a backbone base_key. If the raw graph edge
+        # is quantized and not discovered during floodfill, collect contacts again.
+        for key in comp:
+            for nb in self.dense_adj.get(key, set()):
+                if nb in self.backbone_keys_in_dense:
+                    attachments.add(nb)
+
+        return comp, attachments
+
+    def classify_off_backbone_component(
+        self,
+        comp: Set[NodeKey],
+        attachments: Set[NodeKey],
+        seed_key: NodeKey,
+        base_key: NodeKey,
+        robot_xy: Tuple[float, float],
+    ) -> Tuple[str, str, float]:
+        n = len(comp)
+        if n < self.hole_min_nodes:
+            return 'too_small', f'nodes={n}', 1e6 + n
+
+        if n > self.hole_max_nodes:
+            return 'too_large', f'nodes={n}', 1e6 + n
+
+        points = [self.dense_nodes[k] for k in comp if k in self.dense_nodes]
+        if not points:
+            return 'empty', 'no valid points', 1e6
+
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        dx = max(xs) - min(xs)
+        dy = max(ys) - min(ys)
+        bbox_area = max(dx, 0.05) * max(dy, 0.05)
+
+        if bbox_area < self.hole_min_bbox_area:
+            return 'too_small_area', f'bbox={bbox_area:.3f}', 1e6 + bbox_area
+
+        if bbox_area > self.hole_max_bbox_area:
+            return 'too_large_area', f'bbox={bbox_area:.3f}', 1e6 + bbox_area
+
+        cx = sum(xs) / len(xs)
+        cy = sum(ys) / len(ys)
+        robot_dist = math.hypot(cx - robot_xy[0], cy - robot_xy[1])
+
+        if robot_dist > self.hole_max_robot_distance:
+            return 'too_far', f'dist={robot_dist:.2f}', 1e6 + robot_dist
+
+        unknown_ratio = self.unknown_ratio_near_component(comp)
+        if unknown_ratio >= self.unknown_reject_ratio:
+            return 'frontier', f'unknown_ratio={unknown_ratio:.2f}', 5e5 + unknown_ratio
+
+        mean_d, max_d = self.distance_stats_to_backbone_edges(comp)
+
+        if max_d < self.hole_min_max_distance_to_backbone and mean_d < self.normal_lap_distance_to_backbone:
+            return 'normal_lap', f'mean_backbone_dist={mean_d:.2f}, max={max_d:.2f}', 2e5 + mean_d
+
+        if len(attachments) >= self.normal_lap_attachment_threshold:
+            return 'normal_lap', f'attachments={len(attachments)}', 2e5 + len(attachments)
+
+        # Prefer small and nearby components, and prefer components with fewer
+        # backbone contacts.
+        score = robot_dist + 0.35 * bbox_area + 0.15 * len(attachments)
+        return 'hole', (
+            f'nodes={n}, bbox={bbox_area:.2f}, attach={len(attachments)}, '
+            f'unknown={unknown_ratio:.2f}, d_backbone={mean_d:.2f}/{max_d:.2f}'
+        ), score
+
+    def unknown_ratio_near_component(self, comp: Set[NodeKey]) -> float:
+        if self.unknown_arr is None or self.free_msg is None:
+            return 0.0
+
+        info = self.free_msg.info
+        rad = max(1, int(math.ceil(self.unknown_check_radius / info.resolution)))
+
+        total = 0
+        unknown_hits = 0
+
+        for key in comp:
+            if key not in self.dense_nodes:
+                continue
+
+            x, y = self.dense_nodes[key]
+            cell = self.world_to_cell(x, y)
+            if cell is None:
+                continue
+
+            row, col = cell
+            total += 1
+
+            r0 = max(0, row - rad)
+            r1 = min(self.unknown_arr.shape[0], row + rad + 1)
+            c0 = max(0, col - rad)
+            c1 = min(self.unknown_arr.shape[1], col + rad + 1)
+
+            if bool(np.any(self.unknown_arr[r0:r1, c0:c1])):
+                unknown_hits += 1
+
+        if total <= 0:
+            return 0.0
+
+        return unknown_hits / total
+
+    def distance_stats_to_backbone_edges(self, comp: Set[NodeKey]) -> Tuple[float, float]:
+        if not comp or not self.backbone_raw_edges:
+            return 0.0, 0.0
+
+        edge_segments: List[Tuple[Tuple[float, float], Tuple[float, float]]] = []
+        for a, b in self.backbone_raw_edges:
+            if a in self.backbone_nodes and b in self.backbone_nodes:
+                edge_segments.append((self.backbone_nodes[a], self.backbone_nodes[b]))
+
+        if not edge_segments:
+            return 0.0, 0.0
+
+        distances: List[float] = []
+
+        for key in comp:
+            if key not in self.dense_nodes:
+                continue
+
+            p = self.dense_nodes[key]
+            best = min(self.point_to_segment_distance(p, a, b) for a, b in edge_segments)
+            distances.append(best)
+
+        if not distances:
+            return 0.0, 0.0
+
+        return sum(distances) / len(distances), max(distances)
+
+    def point_to_segment_distance(
+        self,
+        p: Tuple[float, float],
+        a: Tuple[float, float],
+        b: Tuple[float, float]
+    ) -> float:
+        px, py = p
+        ax, ay = a
+        bx, by = b
+        vx = bx - ax
+        vy = by - ay
+        wx = px - ax
+        wy = py - ay
+        vv = vx * vx + vy * vy
+
+        if vv < 1e-9:
+            return math.hypot(px - ax, py - ay)
+
+        t = max(0.0, min(1.0, (wx * vx + wy * vy) / vv))
+        qx = ax + t * vx
+        qy = ay + t * vy
+        return math.hypot(px - qx, py - qy)
+
+    def update_hole_detection(
+        self,
+        current_key: NodeKey,
+        next_goal_key: Optional[NodeKey],
+        robot_xy: Tuple[float, float]
+    ) -> None:
+        candidates = self.find_dense_branch_components(current_key, next_goal_key, robot_xy)
+
+        hole_candidate = None
+        for cand in candidates:
+            if cand['label'] == 'hole':
+                hole_candidate = cand
+                break
+
+        if hole_candidate is None:
+            self.clear_hole_state()
+            if candidates:
+                first = candidates[0]
+                self.get_logger().info(
+                    f'Dense branch found but not hole: label={first["label"]}, reason={first["reason"]}'
+                )
+            return
+
+        comp = set(hole_candidate['component'])
+        attachments = set(hole_candidate['attachments'])
+        seed_key = hole_candidate['seed_key']
+        base_key = hole_candidate['base_key']
+
+        self.latest_hole_component = comp
+        self.latest_hole_attachments = attachments
+        self.latest_hole_entry_key = seed_key
+        self.latest_hole_exit_key = self.choose_hole_exit_key(comp, attachments, seed_key)
+        self.latest_branch_edge = (base_key, seed_key)
+
+        if self.enable_hole_repair_path:
+            self.latest_hole_repair_path = self.build_local_repair_path(
+                comp,
+                entry_key=self.latest_hole_entry_key,
+                exit_key=self.latest_hole_exit_key,
+            )
+        else:
+            self.latest_hole_repair_path = []
+
+        self.get_logger().info(
+            f'Hole detected from dense branch: seed={seed_key}, base={base_key}, '
+            f'exit={self.latest_hole_exit_key}, reason={hole_candidate["reason"]}'
+        )
+
+    def choose_hole_exit_key(
+        self,
+        comp: Set[NodeKey],
+        attachments: Set[NodeKey],
+        entry_key: Optional[NodeKey],
+    ) -> Optional[NodeKey]:
+        if not attachments:
+            return None
+
+        if entry_key not in self.dense_nodes:
+            return next(iter(attachments))
+
+        ex, ey = self.dense_nodes[entry_key]
+
+        # Prefer a backbone attachment away from the entry seed so the visual
+        # repair path has an enter/return direction.
+        best_key = None
+        best_score = -1.0
+
+        for key in attachments:
+            if key not in self.backbone_nodes:
+                continue
+
+            x, y = self.backbone_nodes[key]
+            d = math.hypot(x - ex, y - ey)
+
+            if d > best_score:
+                best_score = d
+                best_key = key
+
+        return best_key if best_key is not None else next(iter(attachments))
+
+    def build_local_repair_path(
+        self,
+        comp: Set[NodeKey],
+        entry_key: Optional[NodeKey],
+        exit_key: Optional[NodeKey],
+    ) -> List[Tuple[float, float]]:
+        points = [self.dense_nodes[k] for k in comp if k in self.dense_nodes]
+        if not points:
+            return []
+
+        # Cluster by y to create a local boustrophedon-like order.
+        pts = sorted(points, key=lambda p: (p[1], p[0]))
+        clusters: List[List[Tuple[float, float]]] = []
+
+        for p in pts:
+            if not clusters:
+                clusters.append([p])
+                continue
+
+            cy = sum(v[1] for v in clusters[-1]) / len(clusters[-1])
+            if abs(p[1] - cy) <= self.hole_repair_lap_tolerance:
+                clusters[-1].append(p)
+            else:
+                clusters.append([p])
+
+        ordered: List[Tuple[float, float]] = []
+        left_to_right = True
+        for cluster in clusters:
+            cluster.sort(key=lambda p: p[0], reverse=not left_to_right)
+            ordered.extend(cluster)
+            left_to_right = not left_to_right
+
+        if not ordered:
+            return []
+
+        # Choose orientation that starts closer to entry.
+        if entry_key in self.dense_nodes:
+            entry_xy = self.dense_nodes[entry_key]
+            d_start = math.hypot(ordered[0][0] - entry_xy[0], ordered[0][1] - entry_xy[1])
+            d_end = math.hypot(ordered[-1][0] - entry_xy[0], ordered[-1][1] - entry_xy[1])
+            if d_end < d_start:
+                ordered.reverse()
+
+        path: List[Tuple[float, float]] = []
+
+        if entry_key in self.dense_nodes:
+            path.append(self.dense_nodes[entry_key])
+
+        for p in ordered:
+            if not path or math.hypot(path[-1][0] - p[0], path[-1][1] - p[1]) > 0.03:
+                path.append(p)
+
+        if exit_key in self.backbone_nodes:
+            ex = self.backbone_nodes[exit_key]
+            if not path or math.hypot(path[-1][0] - ex[0], path[-1][1] - ex[1]) > 0.03:
+                path.append(ex)
+
+        return path[:max(1, self.hole_repair_max_points)]
+
+    def clear_hole_state(self) -> None:
+        self.latest_hole_component.clear()
+        self.latest_hole_attachments.clear()
+        self.latest_hole_entry_key = None
+        self.latest_hole_exit_key = None
+        self.latest_hole_repair_path.clear()
+        self.latest_branch_edge = None
+
+    # ------------------------------------------------------------------
+    # Timer and publishing
+    # ------------------------------------------------------------------
+    def on_timer(self) -> None:
+        if not self.backbone_nodes or not self.backbone_adj:
+            return
+
+        robot_xy = self.get_robot_pose()
+        if robot_xy is None:
+            return
+
+        nearest_key = self.nearest_backbone_key(robot_xy[0], robot_xy[1])
+        if nearest_key is None:
+            return
+
+        reached_goal = self.is_reached_goal(robot_xy)
+
+        if reached_goal:
+            if self.current_goal_key is not None:
+                self.close_backbone_key(self.current_goal_key)
+
+            current_key = self.current_goal_key if self.current_goal_key in self.backbone_nodes else nearest_key
+            self.close_backbone_key(current_key)
+
+            next_goal = self.choose_next_backbone_goal(current_key)
+
+            if next_goal is None and self.enable_graph_transit_to_open:
+                path = self.shortest_path_to_nearest_open_backbone(current_key)
+                if len(path) >= 2:
+                    # Move one graph step at a time along the transit path.
+                    next_goal = path[1]
+                    self.selected_path = [self.backbone_nodes[k] for k in path if k in self.backbone_nodes]
+                    self.get_logger().info(
+                        f'No direct open neighbor. Transit along backbone to {path[-1]} via {next_goal}.'
+                    )
+
+            if next_goal is not None:
+                self.set_new_goal(next_goal, 'backbone coverage')
+                if self.enable_hole_detection:
+                    self.update_hole_detection(current_key, next_goal, robot_xy)
+            else:
+                self.current_goal_key = None
+                self.selected_path.clear()
+                self.clear_hole_state()
+                self.get_logger().info('Backbone coverage appears complete: no open goal found.')
+
+        else:
+            # Dynamic branch check while moving toward current goal.
+            if (
+                self.enable_hole_detection and
+                self.current_goal_key is not None and
+                self.should_update_hole_detection()
+            ):
+                self.update_hole_detection(nearest_key, self.current_goal_key, robot_xy)
+
+        self.publish_state_markers()
+        self.publish_selected_path()
+        self.publish_hole_outputs()
+
+        if self.current_goal_key is not None:
+            # Republish current goal to keep downstream simple controllers alive.
+            self.publish_goal(self.current_goal_key)
+
+    def publish_state_markers(self) -> None:
+        ma = MarkerArray()
+
+        delete_all = Marker()
+        delete_all.header.frame_id = self.map_frame
+        delete_all.header.stamp = self.get_clock().now().to_msg()
+        delete_all.action = Marker.DELETEALL
+        ma.markers.append(delete_all)
+
+        open_marker = Marker()
+        open_marker.header.frame_id = self.map_frame
+        open_marker.header.stamp = delete_all.header.stamp
+        open_marker.ns = 'backbone_open'
+        open_marker.id = 0
+        open_marker.type = Marker.SPHERE_LIST
+        open_marker.action = Marker.ADD
+        open_marker.scale.x = 0.065
+        open_marker.scale.y = 0.065
+        open_marker.scale.z = 0.065
+        open_marker.color.r = 0.0
+        open_marker.color.g = 1.0
+        open_marker.color.b = 0.25
+        open_marker.color.a = 0.75
+        open_marker.pose.orientation.w = 1.0
+
+        closed_marker = Marker()
+        closed_marker.header.frame_id = self.map_frame
+        closed_marker.header.stamp = delete_all.header.stamp
+        closed_marker.ns = 'backbone_closed'
+        closed_marker.id = 1
+        closed_marker.type = Marker.SPHERE_LIST
+        closed_marker.action = Marker.ADD
+        closed_marker.scale.x = 0.075
+        closed_marker.scale.y = 0.075
+        closed_marker.scale.z = 0.075
+        closed_marker.color.r = 1.0
+        closed_marker.color.g = 0.10
+        closed_marker.color.b = 0.10
+        closed_marker.color.a = 0.85
+        closed_marker.pose.orientation.w = 1.0
+
+        for key, (x, y) in self.backbone_nodes.items():
+            pt = Point()
+            pt.x = x
+            pt.y = y
+            pt.z = 0.06
+
+            if self.is_closed_backbone_key(key):
+                closed_marker.points.append(pt)
+            else:
+                open_marker.points.append(pt)
+
+        ma.markers.append(open_marker)
+        ma.markers.append(closed_marker)
+        self.state_marker_pub.publish(ma)
+
+    def publish_selected_path(self) -> None:
+        msg = Path()
+        msg.header.frame_id = self.map_frame
+        msg.header.stamp = self.get_clock().now().to_msg()
+
+        pts = self.selected_path
+        if self.current_goal_key in self.backbone_nodes and not pts:
+            pts = [self.backbone_nodes[self.current_goal_key]]
+
+        for x, y in pts:
+            ps = PoseStamped()
+            ps.header = msg.header
+            ps.pose.position.x = x
+            ps.pose.position.y = y
+            ps.pose.position.z = 0.03
+            ps.pose.orientation.w = 1.0
+            msg.poses.append(ps)
+
+        self.path_pub.publish(msg)
+
+
+    def publish_dynamic_branch_markers(self, stamp) -> None:
+        """
+        Planner-side dynamic branch visualization.
+        Purple/yellow/red edges here are computed from the current local
+        backbone window, not from static RCG generation.
+        """
+        ma = MarkerArray()
+
+        delete_all = Marker()
+        delete_all.header.frame_id = self.map_frame
+        delete_all.header.stamp = stamp
+        delete_all.action = Marker.DELETEALL
+        ma.markers.append(delete_all)
+
+        window_nodes = Marker()
+        window_nodes.header.frame_id = self.map_frame
+        window_nodes.header.stamp = stamp
+        window_nodes.ns = 'dynamic_backbone_window'
+        window_nodes.id = 0
+        window_nodes.type = Marker.SPHERE_LIST
+        window_nodes.action = Marker.ADD
+        window_nodes.scale.x = 0.095
+        window_nodes.scale.y = 0.095
+        window_nodes.scale.z = 0.095
+        window_nodes.color.r = 0.55
+        window_nodes.color.g = 0.85
+        window_nodes.color.b = 1.0
+        window_nodes.color.a = 0.75
+        window_nodes.pose.orientation.w = 1.0
+
+        for key in sorted(self.latest_backbone_window):
+            if key not in self.backbone_nodes:
+                continue
+            x, y = self.backbone_nodes[key]
+            p = Point()
+            p.x = x
+            p.y = y
+            p.z = 0.20
+            window_nodes.points.append(p)
+
+        branch_edges = Marker()
+        branch_edges.header.frame_id = self.map_frame
+        branch_edges.header.stamp = stamp
+        branch_edges.ns = 'dynamic_branch_edges'
+        branch_edges.id = 1
+        branch_edges.type = Marker.LINE_LIST
+        branch_edges.action = Marker.ADD
+        branch_edges.scale.x = 0.045
+        branch_edges.color.r = 1.0
+        branch_edges.color.g = 0.0
+        branch_edges.color.b = 1.0
+        branch_edges.color.a = 0.95
+        branch_edges.pose.orientation.w = 1.0
+
+        rejected_edges = Marker()
+        rejected_edges.header.frame_id = self.map_frame
+        rejected_edges.header.stamp = stamp
+        rejected_edges.ns = 'dynamic_nonhole_branch_edges'
+        rejected_edges.id = 2
+        rejected_edges.type = Marker.LINE_LIST
+        rejected_edges.action = Marker.ADD
+        rejected_edges.scale.x = 0.030
+        rejected_edges.color.r = 1.0
+        rejected_edges.color.g = 0.85
+        rejected_edges.color.b = 0.0
+        rejected_edges.color.a = 0.70
+        rejected_edges.pose.orientation.w = 1.0
+
+        for base, seed, label in self.latest_dynamic_branch_edges:
+            if base not in self.backbone_nodes or seed not in self.dense_nodes:
+                continue
+
+            bx, by = self.backbone_nodes[base]
+            sx, sy = self.dense_nodes[seed]
+
+            p1 = Point()
+            p1.x = bx
+            p1.y = by
+            p1.z = 0.22
+            p2 = Point()
+            p2.x = sx
+            p2.y = sy
+            p2.z = 0.22
+
+            # Purple means: dynamically detected branch candidate from the
+            # current local backbone window. Hole acceptance is shown separately
+            # by /cstar/hole_markers and /cstar/hole_repair_path.
+            branch_edges.points.append(p1)
+            branch_edges.points.append(p2)
+
+            # Optional yellow overlay for candidates that were explicitly
+            # classified as non-hole, useful while tuning filters.
+            if label != 'hole' and self.publish_nonhole_branch_candidates:
+                rejected_edges.points.append(p1)
+                rejected_edges.points.append(p2)
+
+        ma.markers.append(window_nodes)
+        ma.markers.append(branch_edges)
+        ma.markers.append(rejected_edges)
+        self.dynamic_branch_marker_pub.publish(ma)
+
+    def publish_hole_outputs(self) -> None:
+        stamp = self.get_clock().now().to_msg()
+
+        # Hole nodes PoseArray.
+        pose_array = PoseArray()
+        pose_array.header.frame_id = self.map_frame
+        pose_array.header.stamp = stamp
+
+        for key in sorted(self.latest_hole_component):
+            if key not in self.dense_nodes:
+                continue
+
+            x, y = self.dense_nodes[key]
+            pose = Pose()
+            pose.position.x = x
+            pose.position.y = y
+            pose.position.z = 0.08
+            pose.orientation.w = 1.0
+            pose_array.poses.append(pose)
+
+        self.hole_nodes_pub.publish(pose_array)
+
+        self.publish_hole_markers(stamp)
+        self.publish_entry_exit_markers(stamp)
+        self.publish_hole_repair_path(stamp)
+        self.publish_dynamic_branch_markers(stamp)
+
+    def publish_hole_markers(self, stamp) -> None:
+        ma = MarkerArray()
+
+        delete_all = Marker()
+        delete_all.header.frame_id = self.map_frame
+        delete_all.header.stamp = stamp
+        delete_all.action = Marker.DELETEALL
+        ma.markers.append(delete_all)
+
+        nodes_marker = Marker()
+        nodes_marker.header.frame_id = self.map_frame
+        nodes_marker.header.stamp = stamp
+        nodes_marker.ns = 'dense_hole_nodes'
+        nodes_marker.id = 0
+        nodes_marker.type = Marker.SPHERE_LIST
+        nodes_marker.action = Marker.ADD
+        nodes_marker.scale.x = 0.08
+        nodes_marker.scale.y = 0.08
+        nodes_marker.scale.z = 0.08
+        nodes_marker.color.r = 1.0
+        nodes_marker.color.g = 0.0
+        nodes_marker.color.b = 1.0
+        nodes_marker.color.a = 0.92
+        nodes_marker.pose.orientation.w = 1.0
+
+        for key in sorted(self.latest_hole_component):
+            if key not in self.dense_nodes:
+                continue
+            x, y = self.dense_nodes[key]
+            pt = Point()
+            pt.x = x
+            pt.y = y
+            pt.z = 0.10
+            nodes_marker.points.append(pt)
+
+        branch_marker = Marker()
+        branch_marker.header.frame_id = self.map_frame
+        branch_marker.header.stamp = stamp
+        branch_marker.ns = 'dense_hole_branch_edge'
+        branch_marker.id = 1
+        branch_marker.type = Marker.LINE_LIST
+        branch_marker.action = Marker.ADD
+        branch_marker.scale.x = 0.04
+        branch_marker.color.r = 1.0
+        branch_marker.color.g = 0.0
+        branch_marker.color.b = 0.0
+        branch_marker.color.a = 0.95
+        branch_marker.pose.orientation.w = 1.0
+
+        if self.latest_branch_edge is not None:
+            base, seed = self.latest_branch_edge
+            if base in self.backbone_nodes and seed in self.dense_nodes:
+                bx, by = self.backbone_nodes[base]
+                sx, sy = self.dense_nodes[seed]
+
+                p1 = Point()
+                p1.x = bx
+                p1.y = by
+                p1.z = 0.16
+
+                p2 = Point()
+                p2.x = sx
+                p2.y = sy
+                p2.z = 0.16
+
+                branch_marker.points.append(p1)
+                branch_marker.points.append(p2)
+
+        ma.markers.append(nodes_marker)
+        ma.markers.append(branch_marker)
+        self.hole_markers_pub.publish(ma)
+
+    def publish_entry_exit_markers(self, stamp) -> None:
+        entry_ma = MarkerArray()
+        exit_ma = MarkerArray()
+
+        for arr in (entry_ma, exit_ma):
+            delete_all = Marker()
+            delete_all.header.frame_id = self.map_frame
+            delete_all.header.stamp = stamp
+            delete_all.action = Marker.DELETEALL
+            arr.markers.append(delete_all)
+
+        if self.latest_hole_entry_key in self.dense_nodes:
+            x, y = self.dense_nodes[self.latest_hole_entry_key]
+            entry_ma.markers.append(
+                self.make_sphere_marker('hole_entry', 0, x, y, 0.18, (0.0, 1.0, 1.0, 0.95), stamp)
+            )
+
+        if self.latest_hole_exit_key in self.backbone_nodes:
+            x, y = self.backbone_nodes[self.latest_hole_exit_key]
+            exit_ma.markers.append(
+                self.make_sphere_marker('hole_exit', 0, x, y, 0.18, (1.0, 0.55, 0.0, 0.95), stamp)
+            )
+
+        self.hole_entry_marker_pub.publish(entry_ma)
+        self.hole_exit_marker_pub.publish(exit_ma)
+
+    def make_sphere_marker(
+        self,
+        ns: str,
+        marker_id: int,
+        x: float,
+        y: float,
+        size: float,
+        color: Tuple[float, float, float, float],
+        stamp,
+    ) -> Marker:
+        m = Marker()
+        m.header.frame_id = self.map_frame
+        m.header.stamp = stamp
+        m.ns = ns
+        m.id = marker_id
+        m.type = Marker.SPHERE
+        m.action = Marker.ADD
+        m.pose.position.x = x
+        m.pose.position.y = y
+        m.pose.position.z = 0.18
+        m.pose.orientation.w = 1.0
+        m.scale.x = size
+        m.scale.y = size
+        m.scale.z = size
+        m.color.r = color[0]
+        m.color.g = color[1]
+        m.color.b = color[2]
+        m.color.a = color[3]
+        return m
+
+    def publish_hole_repair_path(self, stamp) -> None:
+        msg = Path()
+        msg.header.frame_id = self.map_frame
+        msg.header.stamp = stamp
+
+        for x, y in self.latest_hole_repair_path:
+            ps = PoseStamped()
+            ps.header = msg.header
+            ps.pose.position.x = x
+            ps.pose.position.y = y
+            ps.pose.position.z = 0.05
+            ps.pose.orientation.w = 1.0
+            msg.poses.append(ps)
+
+        self.hole_repair_path_pub.publish(msg)
+
+        ma = MarkerArray()
+        delete_all = Marker()
+        delete_all.header.frame_id = self.map_frame
+        delete_all.header.stamp = stamp
+        delete_all.action = Marker.DELETEALL
+        ma.markers.append(delete_all)
+
+        line = Marker()
+        line.header.frame_id = self.map_frame
+        line.header.stamp = stamp
+        line.ns = 'hole_repair_path'
+        line.id = 0
+        line.type = Marker.LINE_STRIP
+        line.action = Marker.ADD
+        line.scale.x = 0.035
+        line.color.r = 1.0
+        line.color.g = 0.2
+        line.color.b = 0.0
+        line.color.a = 0.90
+        line.pose.orientation.w = 1.0
+
+        for x, y in self.latest_hole_repair_path:
+            p = Point()
+            p.x = x
+            p.y = y
+            p.z = 0.13
+            line.points.append(p)
+
+        ma.markers.append(line)
+        self.hole_repair_markers_pub.publish(ma)
+
+
+def main(args=None) -> None:
+    rclpy.init(args=args)
+    node = CStarWaypointPlannerNode()
+
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

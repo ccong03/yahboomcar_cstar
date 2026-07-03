@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
@@ -22,6 +23,8 @@ class GraphNode:
     lap_id: int
     seg_id: int
     essential: bool
+    endpoint: bool
+    near_frontier: bool
 
 
 Candidate = Tuple[int, bool, bool, int]  # col, endpoint, near_frontier, original_order
@@ -121,6 +124,9 @@ class CStarRCGNode(Node):
         self.obstacle_arr: Optional[np.ndarray] = None
         self.unknown_arr: Optional[np.ndarray] = None
         self.safe_free_arr: Optional[np.ndarray] = None
+        # relaxed_edge_arr 用于边界/障碍物附近端点的特殊连边判断：
+        # 不检查 map_border_buffer 和 obstacle_buffer，但仍然禁止穿过真实障碍和 unknown_buffer。
+        self.relaxed_edge_arr: Optional[np.ndarray] = None
 
         self.create_subscription(OccupancyGrid, self.free_topic, self.free_callback, 10)
         self.create_subscription(OccupancyGrid, self.frontier_topic, self.frontier_callback, 10)
@@ -233,6 +239,7 @@ class CStarRCGNode(Node):
         if self.obstacle_arr is not None:
             obstacle = self.obstacle_arr.copy()
         else:
+            # obstacle_map 没来时，非 free 都按真实不可通行处理。
             obstacle = np.logical_not(free)
 
         if self.unknown_arr is not None:
@@ -247,6 +254,7 @@ class CStarRCGNode(Node):
         obstacle_buffer_mask = self.dilate_bool(obstacle, obstacle_rad)
         unknown_buffer_mask = self.dilate_bool(unknown, unknown_rad)
 
+        # 正常采样用的安全自由区：严格避开 obstacle_buffer、unknown_buffer 和 map_border_buffer。
         safe = free.copy()
         safe[obstacle_buffer_mask] = False
         safe[unknown_buffer_mask] = False
@@ -256,6 +264,14 @@ class CStarRCGNode(Node):
             safe[h - border_rad:, :] = False
             safe[:, :border_rad] = False
             safe[:, w - border_rad:] = False
+
+        # 特殊连边用的 relaxed mask：
+        # 只用于“靠近地图边界/障碍物的端点连边”。它不检查 obstacle_buffer 和 map_border_buffer，
+        # 但仍然禁止穿过真实障碍、未知区缓冲，避免把边直接穿墙或穿进未探索区。
+        relaxed = free.copy()
+        relaxed[obstacle] = False
+        relaxed[unknown_buffer_mask] = False
+        self.relaxed_edge_arr = relaxed
 
         return safe
 
@@ -343,7 +359,9 @@ class CStarRCGNode(Node):
                         y=y,
                         lap_id=lap_id,
                         seg_id=seg_id,
-                        essential=(endpoint or near_frontier)
+                        essential=(endpoint or near_frontier),
+                        endpoint=endpoint,
+                        near_frontier=near_frontier
                     )
 
                     nodes.append(node)
@@ -517,7 +535,7 @@ class CStarRCGNode(Node):
                 if dist > interlap_max_cells:
                     continue
 
-                if not self.line_is_safe(anchor.row, anchor.col, target.row, target.col):
+                if not self.edge_line_is_acceptable(anchor, target):
                     continue
 
                 fallback_candidates.append((abs(dcol), dist, anchor, target))
@@ -555,7 +573,7 @@ class CStarRCGNode(Node):
             if abs(target.col - anchor.col) > endpoint_col_tol_cells:
                 continue
 
-            if not self.line_is_safe(anchor.row, anchor.col, target.row, target.col):
+            if not self.edge_line_is_acceptable(anchor, target):
                 continue
 
             key = (abs(dcol), dist)
@@ -649,7 +667,7 @@ class CStarRCGNode(Node):
         n1 = nodes[a]
         n2 = nodes[b]
 
-        if not self.line_is_safe(n1.row, n1.col, n2.row, n2.col):
+        if not self.edge_line_is_acceptable(n1, n2):
             return False
 
         if self.enable_edge_intersection_check:
@@ -788,6 +806,87 @@ class CStarRCGNode(Node):
                 return False
 
         return True
+
+    def is_relaxed_edge_cell(self, row: int, col: int) -> bool:
+        if self.relaxed_edge_arr is None:
+            return False
+
+        if row < 0 or row >= self.relaxed_edge_arr.shape[0]:
+            return False
+        if col < 0 or col >= self.relaxed_edge_arr.shape[1]:
+            return False
+
+        return bool(self.relaxed_edge_arr[row, col])
+
+    def border_line_is_safe(self, r0: int, c0: int, r1: int, c1: int) -> bool:
+        """
+        边界/障碍物附近端点的放松连边检查：
+        - 不检查 map_border_buffer；
+        - 不检查 obstacle_buffer；
+        - 仍然要求整条线在 free 区域内；
+        - 仍然禁止穿过真实 obstacle 和 unknown_buffer。
+        """
+        if self.relaxed_edge_arr is None:
+            return False
+
+        n = max(abs(r1 - r0), abs(c1 - c0)) + 1
+
+        for i in range(n + 1):
+            t = 0.0 if n == 0 else i / n
+            rr = int(round((1.0 - t) * r0 + t * r1))
+            cc = int(round((1.0 - t) * c0 + t * c1))
+
+            if not self.is_relaxed_edge_cell(rr, cc):
+                return False
+
+        return True
+
+    def is_near_map_border(self, node: GraphNode) -> bool:
+        if self.free_msg is None:
+            return False
+
+        info = self.free_msg.info
+        res = info.resolution
+        border_rad = max(1, int(math.ceil(self.map_border_buffer / res)))
+
+        return (
+            node.row <= border_rad or
+            node.col <= border_rad or
+            node.row >= info.height - 1 - border_rad or
+            node.col >= info.width - 1 - border_rad
+        )
+
+    def is_near_obstacle(self, node: GraphNode) -> bool:
+        if self.obstacle_arr is None or self.free_msg is None:
+            return False
+
+        res = self.free_msg.info.resolution
+        rad = max(1, int(math.ceil(self.obstacle_buffer / res)))
+
+        r0 = max(0, node.row - rad)
+        r1 = min(self.obstacle_arr.shape[0], node.row + rad + 1)
+        c0 = max(0, node.col - rad)
+        c1 = min(self.obstacle_arr.shape[1], node.col + rad + 1)
+
+        return bool(np.any(self.obstacle_arr[r0:r1, c0:c1]))
+
+    def is_relaxable_endpoint(self, node: GraphNode) -> bool:
+        # 只对端点开放放松检查，普通中间 sample 仍使用严格 safe_free_arr。
+        if not node.endpoint:
+            return False
+
+        return self.is_near_map_border(node) or self.is_near_obstacle(node)
+
+    def edge_line_is_acceptable(self, n1: GraphNode, n2: GraphNode) -> bool:
+        # 优先使用严格检查，保证大多数边仍然遵守正常 buffer。
+        if self.line_is_safe(n1.row, n1.col, n2.row, n2.col):
+            return True
+
+        # 只有靠近地图边界/障碍物的端点，才允许使用放松检查。
+        if not (self.is_relaxable_endpoint(n1) or self.is_relaxable_endpoint(n2)):
+            return False
+
+        return self.border_line_is_safe(n1.row, n1.col, n2.row, n2.col)
 
     def cell_to_world(self, col: int, row: int) -> Tuple[float, float]:
         assert self.free_msg is not None
