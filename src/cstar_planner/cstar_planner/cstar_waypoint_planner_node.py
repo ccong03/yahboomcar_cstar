@@ -130,10 +130,6 @@ class CStarWaypointPlannerNode(Node):
         # Floodfill safety cap.
         self.declare_parameter('floodfill_max_nodes', 600)
 
-        # Repair path visualization over accepted hole component.
-        self.declare_parameter('enable_hole_repair_path', True)
-        self.declare_parameter('hole_repair_y_tolerance', 0.16)
-        self.declare_parameter('hole_repair_max_points', 360)
 
         # Debug visualization for seed candidates.
         self.declare_parameter('publish_branch_candidates', True)
@@ -143,33 +139,60 @@ class CStarWaypointPlannerNode(Node):
         # 检测到侧边 hole 后，planner 暂停普通 C*，先把 /cstar/goal 切到
         # 当前 lap 上的 entry_base，再把补扫路径发布到 /cstar/escape_path。
         self.declare_parameter('enable_hole_execution', True)
-        self.declare_parameter('hole_repair_finish_tolerance', 0.12)
-        self.declare_parameter('hole_execution_min_path_points', 2)
 
-        # ========== Resampled hole repair path ==========
-        # Hole detection remains graph-based and unchanged.  Once a hole is
-        # accepted, the repair route is generated from a local free-space mask
-        # by resampling regular boustrophedon waypoints, instead of using the
-        # original dense RCG node/edge order inside the hole.
-        self.declare_parameter('repair_resample_spacing', 0.22)
-        self.declare_parameter('repair_resample_line_spacing', 0.26)
-        self.declare_parameter('repair_roi_margin', 0.35)
-        self.declare_parameter('repair_obstacle_buffer', 0.10)
-        self.declare_parameter('repair_unknown_buffer', 0.05)
+        # ========== Hole-local LocalRepairRCG validation ==========
+        # This stage deliberately does NOT generate or execute a repair route.
+        # It only stabilizes and visualizes:
+        #   1) the virtual gate line;
+        #   2) the active gate-clipped hole mask;
+        #   3) a hole-local RCG-like resampling grid.
+        self.declare_parameter('repair_roi_margin', 0.80)
+        self.declare_parameter('repair_obstacle_buffer', 0.15)
+        self.declare_parameter('repair_unknown_buffer', 0.08)
         self.declare_parameter('repair_scan_band_block_radius', 0.10)
-        self.declare_parameter('repair_min_sample_points', 2)
-        self.declare_parameter('repair_replan_on_reached', False)
-        self.declare_parameter('repair_skip_covered_samples', True)
-        self.declare_parameter('repair_goal_min_spacing', 0.08)
-        # Keep hole repair stable: decide the sweep direction before entering
-        # the hole and execute goals strictly one by one.
-        self.declare_parameter('repair_lock_axis_to_cstar_perpendicular', True)
-        self.declare_parameter('repair_max_goal_step', 0.28)
-        # Keep the resampled repair mask close to the detected hole component.
-        # This prevents the local floodfill from leaking into nearby corridors
-        # and prevents repair segments from crossing walls/unknown areas.
-        self.declare_parameter('repair_component_inflate_radius', 0.32)
-        self.declare_parameter('repair_transition_search_margin', 0.45)
+        self.declare_parameter('repair_gate_tolerance', 0.06)
+        # Move the virtual gate a short distance from the seed into the hole.
+        # This shifts both the yellow visualization line and the gate clipping
+        # half-plane origin, without changing any other repair/C* logic.
+        self.declare_parameter('local_repair_gate_offset_into_hole', 0.10)
+
+        # LocalRepairRCG sampling parameters, adapted from cstar_rcg_node.py.
+        self.declare_parameter('local_repair_lap_spacing', 0.30)
+        self.declare_parameter('local_repair_sample_spacing', 0.34)
+        self.declare_parameter('local_repair_min_run_length', 0.30)
+        self.declare_parameter('local_repair_min_node_keep_distance', 0.15)
+        self.declare_parameter('local_repair_enable_interlap_edges', True)
+        self.declare_parameter('local_repair_interlap_max_dist', 0.55)
+        self.declare_parameter('local_repair_interlap_col_tolerance', 0.18)
+        self.declare_parameter('local_repair_mask_viz_stride', 2)
+        self.declare_parameter('local_repair_gate_viz_length', 2.0)
+
+        # Repair route preview built from LocalRepairRCG lanes.  This stage
+        # only visualizes a one-stroke candidate route; it still does not
+        # command the robot to execute the hole route.
+        self.declare_parameter('local_repair_build_route_preview', True)
+        self.declare_parameter('local_repair_route_include_entry_segment', True)
+        self.declare_parameter('local_repair_route_include_exit_segment', True)
+        self.declare_parameter('local_repair_route_min_lane_nodes', 2)
+
+        # Executable LocalRepair route.  The route is still built from the
+        # stable LocalRepairRCG lanes, but once the robot reaches entry_base we
+        # lock the current preview route and publish each waypoint on /cstar/goal
+        # sequentially.  Normal C* resumes after the locked route is finished.
+        self.declare_parameter('local_repair_execute_route', True)
+        self.declare_parameter('local_repair_goal_tolerance', 0.12)
+        self.declare_parameter('local_repair_goal_passed_tolerance', 0.18)
+        self.declare_parameter('local_repair_min_execute_points', 3)
+        # During HOLE_REPAIR, keep rebuilding active_hole_mask / LocalRepairRCG
+        # / route from the latest map.  The current purple goal is preserved
+        # when it is still safe; otherwise it is re-selected from the robot's
+        # forward progress on the updated route.
+        self.declare_parameter('local_repair_dynamic_update_during_execution', True)
+        self.declare_parameter('local_repair_min_progress_advance', 0.05)
+        # On finish, close all global RCG nodes that fall inside the final
+        # active_hole_mask, not only the original graph component detected at
+        # the doorway.
+        self.declare_parameter('local_repair_close_active_mask_nodes', True)
 
         # ========== Read parameters ==========
         self.rcg_nodes_topic = self.get_parameter('rcg_nodes_topic').value
@@ -230,29 +253,43 @@ class CStarWaypointPlannerNode(Node):
         self.unknown_check_radius = float(self.get_parameter('unknown_check_radius').value)
         self.unknown_reject_ratio = float(self.get_parameter('unknown_reject_ratio').value)
         self.floodfill_max_nodes = int(self.get_parameter('floodfill_max_nodes').value)
-        self.enable_hole_repair_path = bool(self.get_parameter('enable_hole_repair_path').value)
-        self.hole_repair_y_tolerance = float(self.get_parameter('hole_repair_y_tolerance').value)
-        self.hole_repair_max_points = int(self.get_parameter('hole_repair_max_points').value)
         self.publish_branch_candidates = bool(self.get_parameter('publish_branch_candidates').value)
         self.publish_rejected_branch_candidates = bool(self.get_parameter('publish_rejected_branch_candidates').value)
         self.enable_hole_execution = bool(self.get_parameter('enable_hole_execution').value)
-        self.hole_repair_finish_tolerance = float(self.get_parameter('hole_repair_finish_tolerance').value)
-        self.hole_execution_min_path_points = int(self.get_parameter('hole_execution_min_path_points').value)
 
-        self.repair_resample_spacing = float(self.get_parameter('repair_resample_spacing').value)
-        self.repair_resample_line_spacing = float(self.get_parameter('repair_resample_line_spacing').value)
         self.repair_roi_margin = float(self.get_parameter('repair_roi_margin').value)
         self.repair_obstacle_buffer = float(self.get_parameter('repair_obstacle_buffer').value)
         self.repair_unknown_buffer = float(self.get_parameter('repair_unknown_buffer').value)
         self.repair_scan_band_block_radius = float(self.get_parameter('repair_scan_band_block_radius').value)
-        self.repair_min_sample_points = int(self.get_parameter('repair_min_sample_points').value)
-        self.repair_replan_on_reached = bool(self.get_parameter('repair_replan_on_reached').value)
-        self.repair_skip_covered_samples = bool(self.get_parameter('repair_skip_covered_samples').value)
-        self.repair_goal_min_spacing = float(self.get_parameter('repair_goal_min_spacing').value)
-        self.repair_lock_axis_to_cstar_perpendicular = bool(self.get_parameter('repair_lock_axis_to_cstar_perpendicular').value)
-        self.repair_max_goal_step = float(self.get_parameter('repair_max_goal_step').value)
-        self.repair_component_inflate_radius = float(self.get_parameter('repair_component_inflate_radius').value)
-        self.repair_transition_search_margin = float(self.get_parameter('repair_transition_search_margin').value)
+        self.repair_gate_tolerance = float(self.get_parameter('repair_gate_tolerance').value)
+        self.local_repair_gate_offset_into_hole = max(
+            0.0,
+            float(self.get_parameter('local_repair_gate_offset_into_hole').value),
+        )
+        self.local_repair_lap_spacing = float(self.get_parameter('local_repair_lap_spacing').value)
+        self.local_repair_sample_spacing = float(self.get_parameter('local_repair_sample_spacing').value)
+        self.local_repair_min_run_length = float(self.get_parameter('local_repair_min_run_length').value)
+        self.local_repair_min_node_keep_distance = float(self.get_parameter('local_repair_min_node_keep_distance').value)
+        self.local_repair_enable_interlap_edges = bool(self.get_parameter('local_repair_enable_interlap_edges').value)
+        self.local_repair_interlap_max_dist = float(self.get_parameter('local_repair_interlap_max_dist').value)
+        self.local_repair_interlap_col_tolerance = float(self.get_parameter('local_repair_interlap_col_tolerance').value)
+        self.local_repair_mask_viz_stride = max(1, int(self.get_parameter('local_repair_mask_viz_stride').value))
+        self.local_repair_gate_viz_length = float(self.get_parameter('local_repair_gate_viz_length').value)
+        self.local_repair_build_route_preview = bool(self.get_parameter('local_repair_build_route_preview').value)
+        self.local_repair_route_include_entry_segment = bool(self.get_parameter('local_repair_route_include_entry_segment').value)
+        self.local_repair_route_include_exit_segment = bool(self.get_parameter('local_repair_route_include_exit_segment').value)
+        self.local_repair_route_min_lane_nodes = max(1, int(self.get_parameter('local_repair_route_min_lane_nodes').value))
+        self.local_repair_execute_route = bool(self.get_parameter('local_repair_execute_route').value)
+        self.local_repair_goal_tolerance = float(self.get_parameter('local_repair_goal_tolerance').value)
+        self.local_repair_goal_passed_tolerance = float(self.get_parameter('local_repair_goal_passed_tolerance').value)
+        self.local_repair_min_execute_points = max(2, int(self.get_parameter('local_repair_min_execute_points').value))
+        self.local_repair_dynamic_update_during_execution = bool(
+            self.get_parameter('local_repair_dynamic_update_during_execution').value
+        )
+        self.local_repair_min_progress_advance = float(self.get_parameter('local_repair_min_progress_advance').value)
+        self.local_repair_close_active_mask_nodes = bool(
+            self.get_parameter('local_repair_close_active_mask_nodes').value
+        )
 
         # ========== Graph state ==========
         self.nodes: Dict[NodeKey, Tuple[float, float]] = {}
@@ -292,18 +329,21 @@ class CStarWaypointPlannerNode(Node):
         self.active_hole_entry_base_key: Optional[NodeKey] = None
         self.active_hole_seed_key: Optional[NodeKey] = None
         self.active_hole_exit_key: Optional[NodeKey] = None
-        self.active_hole_repair_path: List[Tuple[float, float]] = []
-        # Hole repair is executed as a sequence of normal /cstar/goal targets.
-        # This avoids pure-pursuit oscillation on /cstar/escape_path when the
-        # repair polyline contains tight turns or graph-layout discontinuities.
-        self.active_hole_repair_key_path: List[NodeKey] = []  # legacy field kept for compatibility; not used by resampled repair.
-        self.active_hole_repair_goal_index: int = 0
-        self.active_hole_repair_points: List[Tuple[float, float]] = []
+        # Hole-local LocalRepairRCG validation state.
+        # No one-stroke repair route is generated in this validation version.
+        self.active_hole_gate_origin: Optional[Tuple[float, float]] = None
+        self.active_hole_gate_normal: Optional[Tuple[float, float]] = None
+        self.active_hole_mask: Optional[np.ndarray] = None
+        self.active_hole_roi: Optional[Tuple[int, int, int, int]] = None
+        self.local_repair_axis: str = 'vertical'
+        self.local_repair_nodes: List[Dict[str, object]] = []
+        self.local_repair_edges: Set[Tuple[int, int]] = set()
+        self.local_repair_route_points: List[Tuple[float, float]] = []
+        self.active_hole_execute_route_points: List[Tuple[float, float]] = []
+        self.active_hole_route_goal_index: int = 0
+        self.active_hole_route_progress_s: float = 0.0
         self.active_hole_current_goal_xy: Optional[Tuple[float, float]] = None
-        self.active_hole_branch_edge: Optional[Tuple[NodeKey, NodeKey]] = None
-        self.active_hole_visited_repair_points: List[Tuple[float, float]] = []
-        self.active_hole_repair_axis: str = 'resampled'
-        self.active_hole_repair_axis_locked: bool = False
+        self.active_hole_executed_route_points: List[Tuple[float, float]] = []
 
         # Maps.
         self.covered_map: Optional[OccupancyGrid] = None
@@ -342,6 +382,10 @@ class CStarWaypointPlannerNode(Node):
         self.hole_exit_marker_pub = self.create_publisher(MarkerArray, '/cstar/hole_exit_marker', 10)
         self.hole_repair_path_pub = self.create_publisher(Path, '/cstar/hole_repair_path', 10)
         self.hole_repair_markers_pub = self.create_publisher(MarkerArray, '/cstar/hole_repair_markers', 10)
+        self.hole_gate_markers_pub = self.create_publisher(MarkerArray, '/cstar/hole_gate_markers', 10)
+        self.active_hole_mask_markers_pub = self.create_publisher(Marker, '/cstar/active_hole_mask_marker', 10)
+        self.local_repair_rcg_nodes_pub = self.create_publisher(PoseArray, '/cstar/local_repair_rcg_nodes', 10)
+        self.local_repair_rcg_markers_pub = self.create_publisher(MarkerArray, '/cstar/local_repair_rcg_markers', 10)
 
         self.timer = self.create_timer(self.update_period, self.on_timer)
 
@@ -354,9 +398,7 @@ class CStarWaypointPlannerNode(Node):
             f'min_nodes={self.hole_min_nodes}, max_nodes={self.hole_max_nodes}'
         )
         self.get_logger().info(
-            f'hole_execution={self.enable_hole_execution}, '
-            f'finish_tol={self.hole_repair_finish_tolerance:.2f}, '
-            f'min_path_points={self.hole_execution_min_path_points}'
+            f'hole_execution={self.enable_hole_execution}, mode=LocalRepairRCG validation only'
         )
 
     # ------------------------------------------------------------------
@@ -764,6 +806,39 @@ class CStarWaypointPlannerNode(Node):
             marker.color.g = 1.0
             marker.color.b = 0.2
             marker.color.a = 0.95
+        self.goal_marker_pub.publish(marker)
+
+    def publish_xy_goal(self, xy: Tuple[float, float]) -> None:
+        """Publish a non-RCG repair waypoint on /cstar/goal and /cstar/goal_marker."""
+        x, y = xy
+
+        msg = PoseStamped()
+        msg.header.frame_id = self.map_frame
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.pose.position.x = float(x)
+        msg.pose.position.y = float(y)
+        msg.pose.position.z = 0.0
+        msg.pose.orientation.w = 1.0
+        self.goal_pub.publish(msg)
+
+        marker = Marker()
+        marker.header.frame_id = self.map_frame
+        marker.header.stamp = msg.header.stamp
+        marker.ns = 'cstar_goal'
+        marker.id = 0
+        marker.type = Marker.SPHERE
+        marker.action = Marker.ADD
+        marker.pose.position.x = float(x)
+        marker.pose.position.y = float(y)
+        marker.pose.position.z = 0.10
+        marker.pose.orientation.w = 1.0
+        marker.scale.x = 0.18
+        marker.scale.y = 0.18
+        marker.scale.z = 0.18
+        marker.color.r = 0.7
+        marker.color.g = 0.0
+        marker.color.b = 1.0
+        marker.color.a = 0.95
         self.goal_marker_pub.publish(marker)
 
 
@@ -1549,62 +1624,6 @@ class CStarWaypointPlannerNode(Node):
 
         return best_key
 
-    def build_local_repair_path(self, comp: Set[NodeKey], entry_key: NodeKey, exit_key: Optional[NodeKey]) -> List[Tuple[float, float]]:
-        if not comp:
-            return []
-
-        points = [self.nodes[k] for k in comp if k in self.nodes]
-        if not points:
-            return []
-
-        y_tol = max(0.05, self.hole_repair_y_tolerance)
-        rows: List[List[Tuple[float, float]]] = []
-
-        for p in sorted(points, key=lambda item: (item[1], item[0])):
-            placed = False
-            for row in rows:
-                mean_y = sum(q[1] for q in row) / len(row)
-                if abs(p[1] - mean_y) <= y_tol:
-                    row.append(p)
-                    placed = True
-                    break
-            if not placed:
-                rows.append([p])
-
-        rows.sort(key=lambda row: sum(q[1] for q in row) / len(row))
-
-        if entry_key in self.nodes:
-            entry_xy = self.nodes[entry_key]
-        else:
-            entry_xy = points[0]
-
-        # Choose first row closest to entry, then alternate direction.
-        if rows:
-            start_index = min(
-                range(len(rows)),
-                key=lambda idx: min(math.hypot(p[0] - entry_xy[0], p[1] - entry_xy[1]) for p in rows[idx])
-            )
-            rows = rows[start_index:] + rows[:start_index]
-
-        path: List[Tuple[float, float]] = []
-        if entry_key in self.nodes:
-            path.append(self.nodes[entry_key])
-
-        forward = True
-        for row in rows:
-            ordered = sorted(row, key=lambda p: p[0], reverse=not forward)
-            for p in ordered:
-                if not path or math.hypot(path[-1][0] - p[0], path[-1][1] - p[1]) > 0.03:
-                    path.append(p)
-            forward = not forward
-
-        if exit_key in self.nodes:
-            exit_xy = self.nodes[exit_key]
-            if not path or math.hypot(path[-1][0] - exit_xy[0], path[-1][1] - exit_xy[1]) > 0.03:
-                path.append(exit_xy)
-
-        return path[:max(1, self.hole_repair_max_points)]
-
     def clear_hole_state(self) -> None:
         self.latest_hole_component.clear()
         self.latest_hole_attachments.clear()
@@ -1701,111 +1720,23 @@ class CStarWaypointPlannerNode(Node):
         )
 
         if self.enable_hole_execution and self.mode == 'COVERAGE':
-            self.arm_hole_repair(
+            self.arm_hole_local_repair_rcg(
                 entry_base_key=base_key,
                 seed_key=seed_key,
                 exit_key=exit_key,
                 component=comp,
                 attachments=attachments,
-                repair_path=self.latest_hole_repair_path,
             )
 
 
     # ------------------------------------------------------------------
-    # Hole execution state machine: resampled repair path
+    # Hole-local LocalRepairRCG validation utilities
     # ------------------------------------------------------------------
-    def is_key_reached(
-        self,
-        key: Optional[NodeKey],
-        robot_xy: Tuple[float, float],
-        tolerance: Optional[float] = None,
-    ) -> bool:
-        if key is None or key not in self.nodes:
-            return False
-
-        x, y = self.nodes[key]
-        tol = self.goal_center_tolerance if tolerance is None else tolerance
-        return math.hypot(robot_xy[0] - x, robot_xy[1] - y) <= tol
-
-    def publish_goal_xy(self, x: float, y: float, reason: str = 'hole repair sample') -> None:
-        """Publish a raw XY goal.  This is used only by resampled hole repair."""
-        msg = PoseStamped()
-        msg.header.frame_id = self.map_frame
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.pose.position.x = x
-        msg.pose.position.y = y
-        msg.pose.position.z = 0.0
-        msg.pose.orientation.w = 1.0
-        self.goal_pub.publish(msg)
-
-        marker = Marker()
-        marker.header.frame_id = self.map_frame
-        marker.header.stamp = msg.header.stamp
-        marker.ns = 'cstar_goal'
-        marker.id = 0
-        marker.type = Marker.SPHERE
-        marker.action = Marker.ADD
-        marker.pose.position.x = x
-        marker.pose.position.y = y
-        marker.pose.position.z = 0.10
-        marker.pose.orientation.w = 1.0
-        marker.scale.x = 0.18
-        marker.scale.y = 0.18
-        marker.scale.z = 0.18
-        marker.color.r = 0.7
-        marker.color.g = 0.0
-        marker.color.b = 1.0
-        marker.color.a = 0.95
-        self.goal_marker_pub.publish(marker)
-
     def distance_xy(self, a: Tuple[float, float], b: Tuple[float, float]) -> float:
         return math.hypot(a[0] - b[0], a[1] - b[1])
 
-    def append_xy_point(
-        self,
-        path: List[Tuple[float, float]],
-        point: Tuple[float, float],
-        min_dist: Optional[float] = None,
-    ) -> None:
-        """Append a repair waypoint without allowing one large goal jump.
-
-        Hole repair is executed through ordinary /cstar/goal targets.  If two
-        consecutive resampled points are far apart, insert intermediate goals
-        on the same segment so the purple goal_marker advances gradually, just
-        like normal C* waypoint following.
-        """
-        threshold = self.repair_goal_min_spacing if min_dist is None else min_dist
-        if not path:
-            path.append(point)
-            return
-
-        start = path[-1]
-        dist = self.distance_xy(start, point)
-        if dist < threshold:
-            return
-
-        max_step = max(threshold, self.repair_max_goal_step)
-        if dist <= max_step:
-            path.append(point)
-            return
-
-        n = max(1, int(math.ceil(dist / max_step)))
-        for i in range(1, n + 1):
-            t = float(i) / float(n)
-            intermediate = (
-                start[0] + t * (point[0] - start[0]),
-                start[1] + t * (point[1] - start[1]),
-            )
-            if self.distance_xy(path[-1], intermediate) >= threshold:
-                path.append(intermediate)
-
-    def is_repair_goal_reached(self, robot_xy: Tuple[float, float]) -> bool:
-        if self.active_hole_current_goal_xy is None:
-            return True
-        return self.distance_xy(robot_xy, self.active_hole_current_goal_xy) <= self.hole_repair_finish_tolerance
-
     def build_repair_safe_mask(self) -> Optional[np.ndarray]:
-        """Build a lighter safe mask for local hole repair resampling."""
+        """Build a safe free-space mask for the hole-local RCG sampler."""
         if self.free_msg is None or self.free_arr is None:
             return None
 
@@ -1844,16 +1775,14 @@ class CStarWaypointPlannerNode(Node):
         return safe
 
     def block_scan_band_on_mask(self, mask: np.ndarray, seed_key: NodeKey) -> np.ndarray:
-        """Keep the main lap as the hole boundary, but do not erase the seed."""
+        """Treat the current C* scan band as the outside boundary of the hole."""
         if self.free_msg is None:
             return mask
         out = mask.copy()
         res = self.free_msg.info.resolution
         rad = max(0, int(math.ceil(self.repair_scan_band_block_radius / res)))
         h, w = out.shape
-        seed_cell = None
-        if seed_key in self.nodes:
-            seed_cell = self.world_to_cell(*self.nodes[seed_key])
+        seed_cell = self.world_to_cell(*self.nodes[seed_key]) if seed_key in self.nodes else None
 
         for key in self.latest_scan_band:
             if key not in self.nodes:
@@ -1862,52 +1791,12 @@ class CStarWaypointPlannerNode(Node):
             if cell is None:
                 continue
             r, c = cell
-            r0 = max(0, r - rad)
-            r1 = min(h, r + rad + 1)
-            c0 = max(0, c - rad)
-            c1 = min(w, c + rad + 1)
-            out[r0:r1, c0:c1] = False
+            out[max(0, r - rad):min(h, r + rad + 1), max(0, c - rad):min(w, c + rad + 1)] = False
 
-        # Make sure the first hole cell remains usable.
         if seed_cell is not None:
             sr, sc = seed_cell
             if 0 <= sr < h and 0 <= sc < w:
                 out[sr, sc] = True
-        return out
-
-    def local_mask_floodfill(self, start: GridCell, mask: np.ndarray, roi: Tuple[int, int, int, int]) -> np.ndarray:
-        rmin, rmax, cmin, cmax = roi
-        h, w = mask.shape
-        out = np.zeros_like(mask, dtype=bool)
-        sr, sc = start
-        if sr < 0 or sr >= h or sc < 0 or sc >= w or not mask[sr, sc]:
-            return out
-
-        q = deque([(sr, sc)])
-        visited = {(sr, sc)}
-        out[sr, sc] = True
-        neighbors = [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)]
-
-        while q:
-            r, c = q.popleft()
-            for dr, dc in neighbors:
-                nr = r + dr
-                nc = c + dc
-                if nr < rmin or nr > rmax or nc < cmin or nc > cmax:
-                    continue
-                if nr < 0 or nr >= h or nc < 0 or nc >= w:
-                    continue
-                if (nr, nc) in visited:
-                    continue
-                if not mask[nr, nc]:
-                    continue
-                # Prevent diagonal corner cutting.
-                if dr != 0 and dc != 0:
-                    if not mask[r + dr, c] or not mask[r, c + dc]:
-                        continue
-                visited.add((nr, nc))
-                out[nr, nc] = True
-                q.append((nr, nc))
         return out
 
     def component_cells_and_roi(
@@ -1915,6 +1804,7 @@ class CStarWaypointPlannerNode(Node):
         comp: Set[NodeKey],
         seed_key: NodeKey,
     ) -> Tuple[Set[GridCell], Optional[Tuple[int, int, int, int]]]:
+        """Return component cells and a soft ROI that can grow with active_hole_mask."""
         if self.free_msg is None:
             return set(), None
 
@@ -1925,6 +1815,16 @@ class CStarWaypointPlannerNode(Node):
             cell = self.world_to_cell(*self.nodes[key])
             if cell is not None:
                 cells.add(cell)
+
+        # Important change from the old repair route builder: the ROI is no
+        # longer locked only to the initial component.  Once active_hole_mask
+        # exists, include its current bbox so the mask can expand gradually as
+        # lidar reveals more free cells behind the same fixed gate.
+        if self.active_hole_mask is not None:
+            rows, cols = np.where(self.active_hole_mask)
+            if len(rows) > 0:
+                cells.add((int(rows.min()), int(cols.min())))
+                cells.add((int(rows.max()), int(cols.max())))
 
         if not cells:
             return set(), None
@@ -1941,799 +1841,712 @@ class CStarWaypointPlannerNode(Node):
         cmax = min(w - 1, max(cols) + margin)
         return cells, (rmin, rmax, cmin, cmax)
 
-    def build_hole_repair_mask(self, comp: Set[NodeKey], seed_key: NodeKey) -> Optional[np.ndarray]:
+    def build_hole_gate(
+        self,
+        entry_base_key: NodeKey,
+        seed_key: NodeKey,
+    ) -> Optional[Tuple[Tuple[float, float], Tuple[float, float]]]:
+        """Build a virtual gate; normal points from C* lap into hole.
+
+        The original gate passes through the first hole-side seed.  For a more
+        conservative clipping boundary, shift the gate origin a configurable
+        distance along that normal into the hole.
         """
-        Create a strict local free-space mask for resampled repair.
-
-        Important change from the previous version:
-        - Do not floodfill the whole free ROI around the component.
-        - First build an inflated envelope from the detected hole component,
-          then intersect it with safe free space.
-
-        This keeps the repair route inside the detected hole region and avoids
-        accidental leakage into corridors, walls, or unknown space.
-        """
-        safe = self.build_repair_safe_mask()
-        if safe is None or self.free_msg is None:
+        if entry_base_key not in self.nodes or seed_key not in self.nodes:
             return None
-
-        comp_cells, roi = self.component_cells_and_roi(comp, seed_key)
-        if roi is None or not comp_cells:
+        entry_xy = self.nodes[entry_base_key]
+        seed_xy = self.nodes[seed_key]
+        dx = seed_xy[0] - entry_xy[0]
+        dy = seed_xy[1] - entry_xy[1]
+        norm = math.hypot(dx, dy)
+        if norm < 1e-6:
             return None
+        normal = (dx / norm, dy / norm)
+        offset = self.local_repair_gate_offset_into_hole
+        gate_origin = (seed_xy[0] + offset * normal[0], seed_xy[1] + offset * normal[1])
+        return gate_origin, normal
 
-        h, w = safe.shape
-        res = self.free_msg.info.resolution
-        rmin, rmax, cmin, cmax = roi
-
-        comp_mask = np.zeros_like(safe, dtype=bool)
-        for r, c in comp_cells:
-            if 0 <= r < h and 0 <= c < w:
-                comp_mask[r, c] = True
-
-        inflate_rad = max(1, int(math.ceil(self.repair_component_inflate_radius / res)))
-        envelope = self.dilate_bool(comp_mask, inflate_rad)
-
-        roi_mask = np.zeros_like(safe, dtype=bool)
-        roi_mask[rmin:rmax + 1, cmin:cmax + 1] = True
-
-        candidate = safe & envelope & roi_mask
-        candidate = self.block_scan_band_on_mask(candidate, seed_key)
-
-        seed_cell = None
-        if seed_key in self.nodes:
-            seed_cell = self.world_to_cell(*self.nodes[seed_key])
-        if seed_cell is None:
-            return None
-
-        if not candidate[seed_cell[0], seed_cell[1]]:
-            nearest = self.find_nearest_safe_cell(seed_cell, candidate)
-            if nearest is not None:
-                seed_cell = nearest
-            else:
-                # Fallback: component cells only.  This is still safer than
-                # using the whole ROI, because it cannot create long chords
-                # across walls/unknown regions.
-                fallback = np.zeros_like(safe, dtype=bool)
-                fallback = self.dilate_bool(comp_mask, max(1, inflate_rad // 2)) & safe & roi_mask
-                if 0 <= seed_cell[0] < h and 0 <= seed_cell[1] < w:
-                    fallback[seed_cell[0], seed_cell[1]] = True
-                return fallback
-
-        hole_mask = self.local_mask_floodfill(seed_cell, candidate, roi)
-        if np.count_nonzero(hole_mask) == 0:
-            fallback = self.dilate_bool(comp_mask, max(1, inflate_rad // 2)) & safe & roi_mask
-            if 0 <= seed_cell[0] < h and 0 <= seed_cell[1] < w:
-                fallback[seed_cell[0], seed_cell[1]] = True
-            return fallback
-        return hole_mask
-
-    def sampled_point_is_needed(self, point: Tuple[float, float], always_keep: bool = False) -> bool:
-        if always_keep:
-            return True
-        if not self.repair_skip_covered_samples:
-            return True
-        if self.is_inside_covered_map(point[0], point[1]):
+    def set_active_hole_gate(self, entry_base_key: NodeKey, seed_key: NodeKey) -> bool:
+        gate = self.build_hole_gate(entry_base_key, seed_key)
+        if gate is None:
+            self.active_hole_gate_origin = None
+            self.active_hole_gate_normal = None
             return False
-        if self.is_near_closed_position(point[0], point[1], radius=max(self.closed_position_radius, 0.10)):
-            return False
+        self.active_hole_gate_origin, self.active_hole_gate_normal = gate
         return True
 
-    def find_mask_row_point(self, mask: np.ndarray, row_center: int, col: int, band_half: int) -> Optional[GridCell]:
-        h, w = mask.shape
-        if col < 0 or col >= w:
-            return None
-        best = None
-        best_d = 10 ** 9
-        r0 = max(0, row_center - band_half)
-        r1 = min(h - 1, row_center + band_half)
-        for r in range(r0, r1 + 1):
-            if mask[r, col]:
-                d = abs(r - row_center)
-                if d < best_d:
-                    best_d = d
-                    best = (r, col)
-        return best
+    def point_inside_active_gate(self, xy: Tuple[float, float], tolerance: Optional[float] = None) -> bool:
+        if self.active_hole_gate_origin is None or self.active_hole_gate_normal is None:
+            return True
+        tol = self.repair_gate_tolerance if tolerance is None else tolerance
+        ox, oy = self.active_hole_gate_origin
+        nx, ny = self.active_hole_gate_normal
+        signed = (xy[0] - ox) * nx + (xy[1] - oy) * ny
+        return signed >= -tol
 
-    def find_mask_col_point(self, mask: np.ndarray, row: int, col_center: int, band_half: int) -> Optional[GridCell]:
-        h, w = mask.shape
-        if row < 0 or row >= h:
-            return None
-        best = None
-        best_d = 10 ** 9
-        c0 = max(0, col_center - band_half)
-        c1 = min(w - 1, col_center + band_half)
-        for c in range(c0, c1 + 1):
-            if mask[row, c]:
-                d = abs(c - col_center)
-                if d < best_d:
-                    best_d = d
-                    best = (row, c)
-        return best
-
-    def contiguous_runs(self, values: List[int]) -> List[Tuple[int, int]]:
-        if not values:
-            return []
-        vals = sorted(set(values))
-        runs: List[Tuple[int, int]] = []
-        start = vals[0]
-        prev = vals[0]
-        for v in vals[1:]:
-            if v == prev + 1:
-                prev = v
-                continue
-            runs.append((start, prev))
-            start = v
-            prev = v
-        runs.append((start, prev))
-        return runs
-
-    def mask_line_is_safe(self, a: GridCell, b: GridCell, mask: np.ndarray) -> bool:
-        r0, c0 = a
-        r1, c1 = b
-        n = max(abs(r1 - r0), abs(c1 - c0), 1)
-        h, w = mask.shape
-        for i in range(n + 1):
-            t = i / n
-            rr = int(round((1.0 - t) * r0 + t * r1))
-            cc = int(round((1.0 - t) * c0 + t * c1))
-            if rr < 0 or rr >= h or cc < 0 or cc >= w:
-                return False
-            if not mask[rr, cc]:
-                return False
-        return True
-
-    def nearest_mask_cell(self, cell: Optional[GridCell], mask: np.ndarray) -> Optional[GridCell]:
-        if cell is None:
-            return None
-        row, col = cell
-        h, w = mask.shape
-        if 0 <= row < h and 0 <= col < w and mask[row, col]:
-            return row, col
-
+    def build_gate_half_plane_mask(self, gate_origin=None, gate_normal=None) -> Optional[np.ndarray]:
         if self.free_msg is None:
             return None
-        res = self.free_msg.info.resolution
-        max_rad = max(1, int(math.ceil(self.nearest_safe_search_radius / res)))
-        best_cell = None
-        best_dist = float('inf')
-        for rad in range(1, max_rad + 1):
-            r0 = max(0, row - rad)
-            r1 = min(h - 1, row + rad)
-            c0 = max(0, col - rad)
-            c1 = min(w - 1, col + rad)
-            for rr in range(r0, r1 + 1):
-                for cc in range(c0, c1 + 1):
-                    if not mask[rr, cc]:
-                        continue
-                    d = math.hypot(rr - row, cc - col)
-                    if d < best_dist:
-                        best_dist = d
-                        best_cell = (rr, cc)
-            if best_cell is not None:
-                return best_cell
-        return None
+        origin = gate_origin if gate_origin is not None else self.active_hole_gate_origin
+        normal = gate_normal if gate_normal is not None else self.active_hole_gate_normal
+        if origin is None or normal is None:
+            return None
+        h = self.free_msg.info.height
+        w = self.free_msg.info.width
+        info = self.free_msg.info
+        ox, oy = origin
+        nx, ny = normal
+        mask = np.zeros((h, w), dtype=bool)
+        for r in range(h):
+            y = info.origin.position.y + (r + 0.5) * info.resolution
+            for c in range(w):
+                x = info.origin.position.x + (c + 0.5) * info.resolution
+                signed = (x - ox) * nx + (y - oy) * ny
+                if signed >= -self.repair_gate_tolerance:
+                    mask[r, c] = True
+        return mask
 
-    def a_star_mask_between_cells(
+    def find_nearest_true_cell_in_roi(
         self,
         start: GridCell,
-        goal: GridCell,
         mask: np.ndarray,
-    ) -> List[GridCell]:
-        if start == goal:
-            return [start]
+        roi: Tuple[int, int, int, int],
+    ) -> Optional[GridCell]:
+        sr, sc = start
+        rmin, rmax, cmin, cmax = roi
+        if rmin <= sr <= rmax and cmin <= sc <= cmax and mask[sr, sc]:
+            return sr, sc
+        best = None
+        best_d = float('inf')
+        for r in range(rmin, rmax + 1):
+            for c in range(cmin, cmax + 1):
+                if not mask[r, c]:
+                    continue
+                d = (r - sr) * (r - sr) + (c - sc) * (c - sc)
+                if d < best_d:
+                    best_d = d
+                    best = (r, c)
+        return best
+
+    def local_mask_floodfill(self, start: GridCell, mask: np.ndarray, roi: Tuple[int, int, int, int]) -> np.ndarray:
+        rmin, rmax, cmin, cmax = roi
         h, w = mask.shape
-        if not (0 <= start[0] < h and 0 <= start[1] < w and mask[start[0], start[1]]):
-            return []
-        if not (0 <= goal[0] < h and 0 <= goal[1] < w and mask[goal[0], goal[1]]):
-            return []
+        out = np.zeros_like(mask, dtype=bool)
+        sr, sc = start
+        if sr < 0 or sr >= h or sc < 0 or sc >= w or not mask[sr, sc]:
+            return out
 
-        if self.free_msg is not None:
-            res = self.free_msg.info.resolution
-            margin = max(2, int(math.ceil(self.repair_transition_search_margin / res)))
-        else:
-            margin = 10
-        rmin = max(0, min(start[0], goal[0]) - margin)
-        rmax = min(h - 1, max(start[0], goal[0]) + margin)
-        cmin = max(0, min(start[1], goal[1]) - margin)
-        cmax = min(w - 1, max(start[1], goal[1]) + margin)
-
-        neighbors = [
-            (-1, 0, 1.0), (1, 0, 1.0), (0, -1, 1.0), (0, 1, 1.0),
-            (-1, -1, math.sqrt(2.0)), (-1, 1, math.sqrt(2.0)),
-            (1, -1, math.sqrt(2.0)), (1, 1, math.sqrt(2.0)),
-        ]
-        open_heap: List[Tuple[float, float, GridCell]] = []
-        g_score: Dict[GridCell, float] = {start: 0.0}
-        prev: Dict[GridCell, Optional[GridCell]] = {start: None}
-        visited: Set[GridCell] = set()
-        h0 = math.hypot(goal[0] - start[0], goal[1] - start[1])
-        heapq.heappush(open_heap, (h0, 0.0, start))
-
-        while open_heap:
-            _, current_g, current = heapq.heappop(open_heap)
-            if current in visited:
-                continue
-            visited.add(current)
-            if current == goal:
-                cells = self.reconstruct_grid_path(prev, current)
-                return self.simplify_grid_path(cells, mask)
-
-            r, c = current
-            for dr, dc, cost in neighbors:
+        q = deque([(sr, sc)])
+        visited = {(sr, sc)}
+        out[sr, sc] = True
+        neighbors = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+        while q:
+            r, c = q.popleft()
+            for dr, dc in neighbors:
                 nr = r + dr
                 nc = c + dc
                 if nr < rmin or nr > rmax or nc < cmin or nc > cmax:
                     continue
-                if not mask[nr, nc]:
+                if nr < 0 or nr >= h or nc < 0 or nc >= w:
                     continue
-                if dr != 0 and dc != 0:
-                    if not mask[r + dr, c] or not mask[r, c + dc]:
-                        continue
-                nb = (nr, nc)
-                tentative = current_g + cost
-                if tentative >= g_score.get(nb, float('inf')):
+                if (nr, nc) in visited or not mask[nr, nc]:
                     continue
-                g_score[nb] = tentative
-                prev[nb] = current
-                f = tentative + math.hypot(goal[0] - nr, goal[1] - nc)
-                heapq.heappush(open_heap, (f, tentative, nb))
-        return []
+                visited.add((nr, nc))
+                out[nr, nc] = True
+                q.append((nr, nc))
+        return out
 
-    def append_safe_xy_connection(
+    def build_active_hole_mask(
         self,
-        path: List[Tuple[float, float]],
-        target: Tuple[float, float],
-        mask: np.ndarray,
+        entry_base_key: NodeKey,
+        seed_key: NodeKey,
+        comp: Set[NodeKey],
     ) -> bool:
-        """Append target without drawing a chord through wall/unknown cells."""
-        if not path:
-            self.append_xy_point(path, target)
-            return True
-
-        start_cell = self.nearest_mask_cell(self.world_to_cell(path[-1][0], path[-1][1]), mask)
-        goal_cell = self.nearest_mask_cell(self.world_to_cell(target[0], target[1]), mask)
-        if start_cell is None or goal_cell is None:
+        """Build/update the gate-clipped active_hole_mask from current maps."""
+        safe = self.build_repair_safe_mask()
+        if safe is None or self.free_msg is None:
+            return False
+        if self.active_hole_gate_origin is None or self.active_hole_gate_normal is None:
+            if not self.set_active_hole_gate(entry_base_key, seed_key):
+                return False
+        gate_mask = self.build_gate_half_plane_mask()
+        if gate_mask is None:
             return False
 
-        if self.mask_line_is_safe(start_cell, goal_cell, mask):
-            # Snap to the requested target if it is close to the safe cell.
-            self.append_xy_point(path, target)
-            return True
+        _, roi = self.component_cells_and_roi(comp, seed_key)
+        if roi is None:
+            return False
+        rmin, rmax, cmin, cmax = roi
 
-        cells = self.a_star_mask_between_cells(start_cell, goal_cell, mask)
-        if not cells:
+        candidate = safe & gate_mask
+        candidate = self.block_scan_band_on_mask(candidate, seed_key)
+        roi_mask = np.zeros_like(candidate, dtype=bool)
+        roi_mask[rmin:rmax + 1, cmin:cmax + 1] = True
+        candidate &= roi_mask
+
+        seed_cell = self.world_to_cell(*self.nodes[seed_key]) if seed_key in self.nodes else None
+        if seed_cell is None:
+            return False
+        start = self.find_nearest_true_cell_in_roi(seed_cell, candidate, roi)
+        if start is None:
             return False
 
-        for cell in cells[1:]:
-            self.append_xy_point(path, self.cell_to_world(cell))
-        # If target is a sampled point inside the mask, it should be safe to
-        # append it after the A* goal cell.  The min spacing removes duplicates.
-        self.append_xy_point(path, target)
+        new_mask = self.local_mask_floodfill(start, candidate, roi)
+        if not np.any(new_mask):
+            return False
+
+        if self.active_hole_mask is not None and self.active_hole_mask.shape == new_mask.shape:
+            combined = (self.active_hole_mask | new_mask) & candidate
+            # If current safe/candidate temporarily shrinks due to map noise,
+            # avoid erasing the whole visualization in one cycle.
+            if np.any(combined):
+                self.active_hole_mask = combined
+            else:
+                self.active_hole_mask = new_mask
+        else:
+            self.active_hole_mask = new_mask
+        self.active_hole_roi = roi
         return True
 
-    def append_exit_connection(
-        self,
-        path: List[Tuple[float, float]],
-        exit_xy: Tuple[float, float],
-        mask: np.ndarray,
-    ) -> None:
-        if not path:
-            self.append_xy_point(path, exit_xy)
-            return
-        goal_cell_raw = self.world_to_cell(exit_xy[0], exit_xy[1])
-        goal_cell = self.nearest_mask_cell(goal_cell_raw, mask)
-        start_cell = self.nearest_mask_cell(self.world_to_cell(path[-1][0], path[-1][1]), mask)
-        if start_cell is not None and goal_cell is not None:
-            if self.mask_line_is_safe(start_cell, goal_cell, mask):
-                self.append_xy_point(path, self.cell_to_world(goal_cell))
-            else:
-                cells = self.a_star_mask_between_cells(start_cell, goal_cell, mask)
-                for cell in cells[1:]:
-                    self.append_xy_point(path, self.cell_to_world(cell))
-        # The exit marker is allowed to be just outside the repair mask because
-        # it lies on the main-lap contact.  This final segment is short.
-        if self.distance_xy(path[-1], exit_xy) <= max(0.45, 2.0 * self.repair_resample_line_spacing):
-            self.append_xy_point(path, exit_xy, min_dist=0.02)
+    def determine_local_repair_axis(self) -> str:
+        """Choose LocalRepairRCG lane direction from the fixed gate normal."""
+        if self.active_hole_gate_normal is None:
+            return 'vertical'
+        nx, ny = self.active_hole_gate_normal
+        # If the robot enters mainly along Y, use vertical lanes; if it enters
+        # mainly along X, use horizontal lanes.  This keeps the local sampler
+        # aligned with the hole depth direction instead of arbitrary map rows.
+        return 'vertical' if abs(ny) >= abs(nx) else 'horizontal'
 
-    def build_sample_lanes_axis(
+    def collect_local_laps_from_mask(self, mask: np.ndarray, axis: str, lap_step: int) -> List[int]:
+        if axis == 'horizontal':
+            has_safe = np.any(mask, axis=1)
+        else:
+            has_safe = np.any(mask, axis=0)
+        n = len(has_safe)
+        bands: List[Tuple[int, int]] = []
+        inside = False
+        start = 0
+        for i in range(n):
+            if has_safe[i] and not inside:
+                inside = True
+                start = i
+            elif not has_safe[i] and inside:
+                inside = False
+                end = i - 1
+                if end >= start:
+                    bands.append((start, end))
+        if inside:
+            bands.append((start, n - 1))
+
+        laps: Set[int] = set()
+        for start, end in bands:
+            width = end - start + 1
+            if width <= max(2, lap_step // 2):
+                laps.add((start + end) // 2)
+                continue
+            i = start
+            local: List[int] = []
+            while i <= end:
+                local.append(i)
+                i += lap_step
+            if local:
+                laps.update(local)
+                if end - local[-1] >= max(2, lap_step // 2):
+                    laps.add(end)
+        return sorted(laps)
+
+    def find_local_safe_runs(self, mask: np.ndarray, axis: str, lap_index: int) -> List[Tuple[int, int]]:
+        runs: List[Tuple[int, int]] = []
+        if self.free_msg is None:
+            return runs
+        res = self.free_msg.info.resolution
+        min_cells = max(1, int(round(self.local_repair_min_run_length / res)))
+        if axis == 'horizontal':
+            arr = mask[lap_index, :]
+        else:
+            arr = mask[:, lap_index]
+
+        inside = False
+        start = 0
+        for i, val in enumerate(arr):
+            if bool(val) and not inside:
+                inside = True
+                start = i
+            elif not bool(val) and inside:
+                inside = False
+                end = i - 1
+                if end >= start and (end - start + 1) >= min_cells:
+                    runs.append((start, end))
+        if inside:
+            end = len(arr) - 1
+            if end >= start and (end - start + 1) >= min_cells:
+                runs.append((start, end))
+        return runs
+
+    def local_sample_segment(self, start: int, end: int, step: int) -> List[int]:
+        if end <= start:
+            return [start]
+        length = end - start + 1
+        if length <= max(2, int(0.75 * step)):
+            return [(start + end) // 2]
+        values = list(range(start, end + 1, step))
+        if values[-1] != end:
+            values.append(end)
+        return sorted(set(values))
+
+    def filter_local_close_candidates(self, candidates: List[Tuple[int, bool, int]]) -> List[Tuple[int, bool, int]]:
+        if not candidates or self.free_msg is None:
+            return candidates
+        candidates = sorted(candidates, key=lambda item: item[0])
+        res = self.free_msg.info.resolution
+        min_dist_cells = max(1, int(round(self.local_repair_min_node_keep_distance / res)))
+        kept: List[Tuple[int, bool, int]] = []
+        for cand in candidates:
+            value, endpoint, order = cand
+            if not kept:
+                kept.append(cand)
+                continue
+            prev_value, prev_endpoint, _ = kept[-1]
+            if abs(value - prev_value) >= min_dist_cells:
+                kept.append(cand)
+                continue
+            if endpoint and not prev_endpoint:
+                kept[-1] = cand
+        last = candidates[-1]
+        if last not in kept:
+            if not kept or abs(last[0] - kept[-1][0]) >= min_dist_cells:
+                kept.append(last)
+        return kept
+
+    def local_cell_to_world(self, row: int, col: int) -> Tuple[float, float]:
+        assert self.free_msg is not None
+        info = self.free_msg.info
+        x = info.origin.position.x + (col + 0.5) * info.resolution
+        y = info.origin.position.y + (row + 0.5) * info.resolution
+        return x, y
+
+    def local_line_is_safe(self, mask: np.ndarray, a: Dict[str, object], b: Dict[str, object]) -> bool:
+        r0 = int(a['row']); c0 = int(a['col'])
+        r1 = int(b['row']); c1 = int(b['col'])
+        n = max(abs(r1 - r0), abs(c1 - c0)) + 1
+        h, w = mask.shape
+        for i in range(n + 1):
+            t = 0.0 if n == 0 else i / n
+            rr = int(round((1.0 - t) * r0 + t * r1))
+            cc = int(round((1.0 - t) * c0 + t * c1))
+            if rr < 0 or rr >= h or cc < 0 or cc >= w or not mask[rr, cc]:
+                return False
+        return True
+
+    def xy_line_is_safe_on_mask(
         self,
-        mask: np.ndarray,
-        axis: str,
-    ) -> List[Dict[str, object]]:
-        if self.free_msg is None or np.count_nonzero(mask) == 0:
-            return []
+        a: Tuple[float, float],
+        b: Tuple[float, float],
+        mask: Optional[np.ndarray],
+    ) -> bool:
+        if mask is None or self.free_msg is None:
+            return False
+        ca = self.world_to_cell(a[0], a[1])
+        cb = self.world_to_cell(b[0], b[1])
+        if ca is None or cb is None:
+            return False
+        r0, c0 = ca
+        r1, c1 = cb
+        n = max(abs(r1 - r0), abs(c1 - c0)) + 1
+        h, w = mask.shape
+        for i in range(n + 1):
+            t = 0.0 if n == 0 else i / n
+            rr = int(round((1.0 - t) * r0 + t * r1))
+            cc = int(round((1.0 - t) * c0 + t * c1))
+            if rr < 0 or rr >= h or cc < 0 or cc >= w or not mask[rr, cc]:
+                return False
+        return True
+
+    def xy_line_is_repair_safe(self, a: Tuple[float, float], b: Tuple[float, float]) -> bool:
+        # Use the full repair-safe mask for entry/exit connectors.  This still
+        # rejects real obstacles and unknown-buffer cells, but does not require
+        # the endpoint to be inside active_hole_mask, because entry_base /
+        # exit_key can lie just outside the virtual gate.
+        safe = self.build_repair_safe_mask()
+        return self.xy_line_is_safe_on_mask(a, b, safe)
+
+    def local_segments_overlap_or_near(self, a0: int, a1: int, b0: int, b1: int, tol: int) -> bool:
+        return min(a1, b1) + tol >= max(a0, b0) - tol
+
+    def try_add_local_edge(self, edges: Set[Tuple[int, int]], nodes: List[Dict[str, object]], i: int, j: int, mask: np.ndarray) -> bool:
+        if i == j:
+            return False
+        a, b = min(i, j), max(i, j)
+        if (a, b) in edges:
+            return False
+        if not self.local_line_is_safe(mask, nodes[a], nodes[b]):
+            return False
+        edges.add((a, b))
+        return True
+
+    def build_local_repair_rcg(self) -> None:
+        """Build an internal RCG-like grid inside active_hole_mask only."""
+        self.local_repair_nodes = []
+        self.local_repair_edges = set()
+        self.local_repair_route_points = []
+        if self.active_hole_mask is None or self.free_msg is None:
+            return
+        mask = self.active_hole_mask
+        if not np.any(mask):
+            return
 
         res = self.free_msg.info.resolution
-        sample_step = max(1, int(round(self.repair_resample_spacing / res)))
-        line_step = max(1, int(round(self.repair_resample_line_spacing / res)))
-        band_half = max(0, line_step // 2)
-        ys, xs = np.where(mask)
-        rmin, rmax = int(np.min(ys)), int(np.max(ys))
-        cmin, cmax = int(np.min(xs)), int(np.max(xs))
+        lap_step = max(1, int(round(self.local_repair_lap_spacing / res)))
+        sample_step = max(1, int(round(self.local_repair_sample_spacing / res)))
+        interlap_max_cells = max(1.0, self.local_repair_interlap_max_dist / res)
+        interlap_tol_cells = max(1, int(round(self.local_repair_interlap_col_tolerance / res)))
+
+        axis = self.determine_local_repair_axis()
+        self.local_repair_axis = axis
+        laps = self.collect_local_laps_from_mask(mask, axis, lap_step)
+        lap_seg_to_nodes: Dict[Tuple[int, int], List[Dict[str, object]]] = {}
+        lap_seg_bounds: Dict[Tuple[int, int], Tuple[int, int]] = {}
+
+        for lap_id, lap_index in enumerate(laps):
+            runs = self.find_local_safe_runs(mask, axis, lap_index)
+            for seg_id, (start, end) in enumerate(runs):
+                samples = self.local_sample_segment(start, end, sample_step)
+                candidates: List[Tuple[int, bool, int]] = []
+                for order, along in enumerate(samples):
+                    endpoint = (order == 0 or order == len(samples) - 1)
+                    candidates.append((along, endpoint, order))
+                candidates = self.filter_local_close_candidates(candidates)
+                kept: List[Dict[str, object]] = []
+                for along, endpoint, order in candidates:
+                    if axis == 'horizontal':
+                        row, col = lap_index, along
+                    else:
+                        row, col = along, lap_index
+                    if row < 0 or row >= mask.shape[0] or col < 0 or col >= mask.shape[1] or not mask[row, col]:
+                        continue
+                    x, y = self.local_cell_to_world(row, col)
+                    node: Dict[str, object] = {
+                        'idx': len(self.local_repair_nodes),
+                        'row': row,
+                        'col': col,
+                        'x': x,
+                        'y': y,
+                        'lap_id': lap_id,
+                        'seg_id': seg_id,
+                        'endpoint': endpoint,
+                    }
+                    self.local_repair_nodes.append(node)
+                    kept.append(node)
+                for a, b in zip(kept[:-1], kept[1:]):
+                    self.try_add_local_edge(self.local_repair_edges, self.local_repair_nodes, int(a['idx']), int(b['idx']), mask)
+                lap_seg_to_nodes[(lap_id, seg_id)] = kept
+                lap_seg_bounds[(lap_id, seg_id)] = (start, end)
+
+        if not self.local_repair_enable_interlap_edges:
+            return
+
+        for lap_id in range(len(laps) - 1):
+            if abs(laps[lap_id + 1] - laps[lap_id]) > interlap_max_cells:
+                continue
+            curr_seg_ids = sorted(key[1] for key in lap_seg_to_nodes.keys() if key[0] == lap_id)
+            next_seg_ids = sorted(key[1] for key in lap_seg_to_nodes.keys() if key[0] == lap_id + 1)
+            for curr_seg_id in curr_seg_ids:
+                seg_a = lap_seg_to_nodes.get((lap_id, curr_seg_id), [])
+                if not seg_a:
+                    continue
+                a0, a1 = lap_seg_bounds[(lap_id, curr_seg_id)]
+                for next_seg_id in next_seg_ids:
+                    seg_b = lap_seg_to_nodes.get((lap_id + 1, next_seg_id), [])
+                    if not seg_b:
+                        continue
+                    b0, b1 = lap_seg_bounds[(lap_id + 1, next_seg_id)]
+                    if not self.local_segments_overlap_or_near(a0, a1, b0, b1, interlap_tol_cells):
+                        continue
+                    pair_candidates: List[Tuple[float, float, Dict[str, object], Dict[str, object]]] = []
+                    for a in seg_a:
+                        for b in seg_b:
+                            along_a = int(a['col']) if axis == 'horizontal' else int(a['row'])
+                            along_b = int(b['col']) if axis == 'horizontal' else int(b['row'])
+                            lap_a = int(a['row']) if axis == 'horizontal' else int(a['col'])
+                            lap_b = int(b['row']) if axis == 'horizontal' else int(b['col'])
+                            dalong = float(along_b - along_a)
+                            dlap = float(lap_b - lap_a)
+                            dist = math.hypot(dalong, dlap)
+                            if dist > interlap_max_cells or abs(dalong) > interlap_tol_cells:
+                                continue
+                            if not self.local_line_is_safe(mask, a, b):
+                                continue
+                            pair_candidates.append((abs(dalong), dist, a, b))
+                    pair_candidates.sort(key=lambda item: (item[0], item[1]))
+                    used_a: Set[int] = set()
+                    used_b: Set[int] = set()
+                    for _, _, a, b in pair_candidates:
+                        ai = int(a['idx']); bi = int(b['idx'])
+                        if ai in used_a or bi in used_b:
+                            continue
+                        if self.try_add_local_edge(self.local_repair_edges, self.local_repair_nodes, ai, bi, mask):
+                            used_a.add(ai)
+                            used_b.add(bi)
+
+    def append_route_point(self, route: List[Tuple[float, float]], xy: Tuple[float, float]) -> None:
+        if route:
+            lx, ly = route[-1]
+            if math.hypot(xy[0] - lx, xy[1] - ly) < 0.03:
+                return
+        route.append((float(xy[0]), float(xy[1])))
+
+    def local_node_xy(self, node: Dict[str, object]) -> Tuple[float, float]:
+        return float(node['x']), float(node['y'])
+
+    def local_node_lap_coord(self, node: Dict[str, object]) -> int:
+        # The lap coordinate is the coordinate perpendicular to a cleaning lane.
+        # For horizontal lanes it is the row; for vertical lanes it is the col.
+        return int(node['row']) if self.local_repair_axis == 'horizontal' else int(node['col'])
+
+    def local_node_along_coord(self, node: Dict[str, object]) -> int:
+        # The along coordinate is the coordinate along a cleaning lane.
+        return int(node['col']) if self.local_repair_axis == 'horizontal' else int(node['row'])
+
+    def local_repair_lane_groups(self) -> List[Dict[str, object]]:
+        groups: Dict[Tuple[int, int], List[Dict[str, object]]] = {}
+        for node in self.local_repair_nodes:
+            key = (int(node['lap_id']), int(node['seg_id']))
+            groups.setdefault(key, []).append(node)
+
         lanes: List[Dict[str, object]] = []
-
-        if axis == 'horizontal':
-            centers = list(range(rmin, rmax + 1, line_step))
-            if centers and centers[-1] != rmax and rmax - centers[-1] > max(1, line_step // 2):
-                centers.append(rmax)
-            for row_center in centers:
-                r0 = max(0, row_center - band_half)
-                r1 = min(mask.shape[0] - 1, row_center + band_half)
-                cols = np.where(np.any(mask[r0:r1 + 1, :], axis=0))[0]
-                cols = [int(c) for c in cols if cmin <= c <= cmax]
-                for run_start, run_end in self.contiguous_runs(cols):
-                    lane: List[Tuple[float, float]] = []
-                    sampled_cols = list(range(run_start, run_end + 1, sample_step))
-                    if sampled_cols and sampled_cols[-1] != run_end:
-                        sampled_cols.append(run_end)
-                    for c in sampled_cols:
-                        cell = self.find_mask_row_point(mask, row_center, c, band_half)
-                        if cell is None:
-                            continue
-                        p = self.cell_to_world(cell)
-                        if self.sampled_point_is_needed(p):
-                            self.append_xy_point(lane, p)
-                    if lane:
-                        lanes.append({'center': row_center, 'points': lane})
-        else:
-            centers = list(range(cmin, cmax + 1, line_step))
-            if centers and centers[-1] != cmax and cmax - centers[-1] > max(1, line_step // 2):
-                centers.append(cmax)
-            for col_center in centers:
-                c0 = max(0, col_center - band_half)
-                c1 = min(mask.shape[1] - 1, col_center + band_half)
-                rows = np.where(np.any(mask[:, c0:c1 + 1], axis=1))[0]
-                rows = [int(r) for r in rows if rmin <= r <= rmax]
-                for run_start, run_end in self.contiguous_runs(rows):
-                    lane = []
-                    sampled_rows = list(range(run_start, run_end + 1, sample_step))
-                    if sampled_rows and sampled_rows[-1] != run_end:
-                        sampled_rows.append(run_end)
-                    for r in sampled_rows:
-                        cell = self.find_mask_col_point(mask, r, col_center, band_half)
-                        if cell is None:
-                            continue
-                        p = self.cell_to_world(cell)
-                        if self.sampled_point_is_needed(p):
-                            self.append_xy_point(lane, p)
-                    if lane:
-                        lanes.append({'center': col_center, 'points': lane})
-
-        lanes.sort(key=lambda item: int(item['center']))
+        min_nodes = max(1, self.local_repair_route_min_lane_nodes)
+        for (lap_id, seg_id), nodes in groups.items():
+            ordered = sorted(nodes, key=self.local_node_along_coord)
+            if len(ordered) < min_nodes:
+                continue
+            along_values = [self.local_node_along_coord(n) for n in ordered]
+            lap_values = [self.local_node_lap_coord(n) for n in ordered]
+            length_cells = max(along_values) - min(along_values) if along_values else 0
+            lanes.append({
+                'lap_id': lap_id,
+                'seg_id': seg_id,
+                'nodes': ordered,
+                'lap_coord': int(round(sum(lap_values) / max(1, len(lap_values)))),
+                'length_cells': length_cells,
+            })
+        lanes.sort(key=lambda lane: (int(lane['lap_coord']), int(lane['seg_id'])))
         return lanes
 
-    def assemble_lanes_safely(
-        self,
-        lanes: List[Dict[str, object]],
-        start_ref: Tuple[float, float],
-        mask: np.ndarray,
-        reverse_order: bool,
-    ) -> List[Tuple[float, float]]:
-        if reverse_order:
-            ordered_lanes = list(reversed(lanes))
-        else:
-            ordered_lanes = list(lanes)
+    def route_exit_lap_coordinate(self) -> Optional[int]:
+        if self.active_hole_exit_key is None or self.active_hole_exit_key not in self.nodes:
+            return None
+        ex, ey = self.nodes[self.active_hole_exit_key]
+        cell = self.world_to_cell(ex, ey)
+        if cell is None:
+            return None
+        row, col = cell
+        return row if self.local_repair_axis == 'horizontal' else col
 
-        path: List[Tuple[float, float]] = []
-        prefer_forward = True
-        for lane_info in ordered_lanes:
-            lane = list(lane_info['points'])  # type: ignore[index]
-            if not lane:
-                continue
-
-            lane_fwd = lane
-            lane_rev = list(reversed(lane))
-            ref = path[-1] if path else start_ref
-
-            if path:
-                df = self.distance_xy(ref, lane_fwd[0])
-                dr = self.distance_xy(ref, lane_rev[0])
-                ordered = lane_fwd if df <= dr else lane_rev
-            else:
-                df = self.distance_xy(ref, lane_fwd[0])
-                dr = self.distance_xy(ref, lane_rev[0])
-                ordered = lane_fwd if df <= dr else lane_rev
-                prefer_forward = ordered is lane_rev
-
-            # Keep the general boustrophedon alternation, but never force an
-            # unsafe long chord.  If the alternated end is much worse, use the
-            # near end and let the safe connector handle the transition.
-            if path and prefer_forward:
-                alt = lane_fwd
-            elif path:
-                alt = lane_rev
-            else:
-                alt = ordered
-            if path and self.distance_xy(path[-1], alt[0]) <= self.distance_xy(path[-1], ordered[0]) + self.repair_resample_line_spacing:
-                ordered = alt
-
-            if path:
-                if not self.append_safe_xy_connection(path, ordered[0], mask):
-                    # Do not draw an unsafe line.  Skip disconnected lanes.
-                    continue
-            else:
-                self.append_xy_point(path, ordered[0])
-
-            for p in ordered[1:]:
-                if not self.append_safe_xy_connection(path, p, mask):
-                    # Within a lane this should rarely fail, because each lane
-                    # comes from a contiguous mask run.  Stop this lane instead
-                    # of creating a chord through an obstacle.
-                    break
-            prefer_forward = not prefer_forward
-        return path
-
-    def determine_locked_repair_axis(self, entry_base_key: NodeKey, seed_key: NodeKey) -> str:
-        """Choose repair sweep direction before entering the hole.
-
-        The repair stroke direction should be perpendicular to the normal C*
-        sweep direction at the moment the side hole is found.  In the current
-        dense RCG, normal C* same-lap sweeping is horizontal, so the repair
-        path should use vertical lanes.  The generic branch below keeps this
-        valid if a future map uses vertical same-lap motion.
-        """
-        if not self.repair_lock_axis_to_cstar_perpendicular:
-            return 'vertical'
-
-        basis = self.current_motion_basis(entry_base_key, self.current_goal_key)
-        if basis is None:
-            # Current implementation's stable C* sweep is horizontal.
-            return 'vertical'
-        u, _ = basis
-        if abs(u[0]) >= abs(u[1]):
-            return 'vertical'
-        return 'horizontal'
-
-    def locked_lane_direction_sign(
-        self,
-        axis: str,
-        entry_xy: Tuple[float, float],
-        exit_xy: Tuple[float, float],
-    ) -> int:
-        """Order repair lanes from entry toward exit/main C* progress."""
-        if axis == 'vertical':
-            delta = exit_xy[0] - entry_xy[0]
-            if abs(delta) > 0.05:
-                return 1 if delta > 0.0 else -1
-            return 1 if self.sweep_dir > 0.0 else -1
-
-        delta = exit_xy[1] - entry_xy[1]
-        if abs(delta) > 0.05:
-            return 1 if delta > 0.0 else -1
-        return 1
-
-    def order_lanes_from_entry(
-        self,
-        lanes: List[Dict[str, object]],
-        axis: str,
-        seed_xy: Tuple[float, float],
-        exit_xy: Tuple[float, float],
-    ) -> List[Dict[str, object]]:
-        """Start at the lane nearest the entry seed and move monotonically.
-
-        This avoids the old behavior where the selected route could begin at a
-        far corner of the hole, causing the purple goal_marker to jump from one
-        side of the room to the other.
-        """
-        if not lanes or self.free_msg is None:
+    def order_local_repair_lanes_for_route(self, lanes: List[Dict[str, object]]) -> List[Dict[str, object]]:
+        if len(lanes) <= 1:
             return lanes
-
-        seed_cell = self.world_to_cell(seed_xy[0], seed_xy[1])
-        exit_cell = self.world_to_cell(exit_xy[0], exit_xy[1])
-        if seed_cell is None:
+        exit_coord = self.route_exit_lap_coordinate()
+        if exit_coord is None:
             return lanes
+        min_coord = int(lanes[0]['lap_coord'])
+        max_coord = int(lanes[-1]['lap_coord'])
+        # Make the last lane the one nearer to the chosen exit side.  The route
+        # therefore sweeps from one side of the hole toward the other side.
+        if abs(max_coord - exit_coord) <= abs(min_coord - exit_coord):
+            return lanes
+        return list(reversed(lanes))
 
-        seed_center = seed_cell[1] if axis == 'vertical' else seed_cell[0]
-        exit_center = None
-        if exit_cell is not None:
-            exit_center = exit_cell[1] if axis == 'vertical' else exit_cell[0]
-
-        sign = self.locked_lane_direction_sign(axis, seed_xy, exit_xy)
-        sorted_lanes = sorted(lanes, key=lambda item: int(item['center']))
-
-        start_idx = min(
-            range(len(sorted_lanes)),
-            key=lambda idx: abs(int(sorted_lanes[idx]['center']) - seed_center),
-        )
-
-        if sign >= 0:
-            forward = sorted_lanes[start_idx:]
-            # Keep a small behind-entry allowance only if the exit lies behind.
-            if exit_center is not None and exit_center < seed_center:
-                forward = sorted_lanes[:start_idx + 1][::-1]
-        else:
-            forward = sorted_lanes[:start_idx + 1][::-1]
-            if exit_center is not None and exit_center > seed_center:
-                forward = sorted_lanes[start_idx:]
-
-        return forward if forward else sorted_lanes
-
-    def assemble_lanes_locked(
-        self,
-        lanes: List[Dict[str, object]],
-        axis: str,
-        seed_xy: Tuple[float, float],
-        exit_xy: Tuple[float, float],
-        mask: np.ndarray,
-    ) -> List[Tuple[float, float]]:
-        """Assemble a fixed-axis boustrophedon route.
-
-        Lane order is locked from entry toward exit; only the direction inside
-        each lane alternates.  We never reverse the whole route by scoring, so
-        the repair plan cannot flip between left-right and up-down forms.
-        """
-        ordered_lanes = self.order_lanes_from_entry(lanes, axis, seed_xy, exit_xy)
-        path: List[Tuple[float, float]] = []
-        reverse_inside = False
-
-        for lane_info in ordered_lanes:
-            lane = list(lane_info['points'])  # type: ignore[index]
-            if not lane:
-                continue
-
-            lane_fwd = lane
-            lane_rev = list(reversed(lane))
-
-            if not path:
-                # For the first lane, start at the endpoint closest to the seed.
-                ordered = lane_fwd if self.distance_xy(seed_xy, lane_fwd[0]) <= self.distance_xy(seed_xy, lane_rev[0]) else lane_rev
-                reverse_inside = ordered is lane_rev
-            else:
-                # After that, strict boustrophedon alternation.  If the intended
-                # connector is impossible in the mask, skip the lane rather than
-                # drawing a chord across unknown/wall cells.
-                ordered = lane_rev if not reverse_inside else lane_fwd
-
-            if path:
-                if not self.append_safe_xy_connection(path, ordered[0], mask):
+    def local_graph_node_path(self, start_idx: int, goal_idx: int) -> List[int]:
+        if start_idx == goal_idx:
+            return [start_idx]
+        adj: Dict[int, List[int]] = {}
+        for i, j in self.local_repair_edges:
+            adj.setdefault(i, []).append(j)
+            adj.setdefault(j, []).append(i)
+        q = deque([start_idx])
+        prev: Dict[int, Optional[int]] = {start_idx: None}
+        while q:
+            cur = q.popleft()
+            if cur == goal_idx:
+                break
+            for nb in adj.get(cur, []):
+                if nb in prev:
                     continue
-            else:
-                self.append_xy_point(path, ordered[0])
-
-            ok = True
-            for p in ordered[1:]:
-                if not self.append_safe_xy_connection(path, p, mask):
-                    ok = False
-                    break
-            if ok:
-                reverse_inside = not reverse_inside
-
-        return path
-
-    def resample_mask_axis(
-        self,
-        mask: np.ndarray,
-        axis: str,
-        entry_xy: Tuple[float, float],
-        seed_xy: Tuple[float, float],
-        exit_xy: Tuple[float, float],
-    ) -> List[Tuple[float, float]]:
-        lanes = self.build_sample_lanes_axis(mask, axis)
-        if not lanes:
+                prev[nb] = cur
+                q.append(nb)
+        if goal_idx not in prev:
             return []
+        path: List[int] = []
+        cur: Optional[int] = goal_idx
+        while cur is not None:
+            path.append(cur)
+            cur = prev.get(cur)
+        path.reverse()
+        return path
 
-        path = self.assemble_lanes_locked(
-            lanes=lanes,
-            axis=axis,
-            seed_xy=seed_xy,
-            exit_xy=exit_xy,
-            mask=mask,
-        )
-        return path[:max(1, self.hole_repair_max_points)]
-
-    def path_score(self, path: List[Tuple[float, float]], sample_count: int) -> float:
-        if len(path) <= 1:
-            return 1e9
-        length = 0.0
-        turn_penalty = 0.0
-        for i in range(len(path) - 1):
-            length += self.distance_xy(path[i], path[i + 1])
-        for i in range(1, len(path) - 1):
-            ax = path[i][0] - path[i - 1][0]
-            ay = path[i][1] - path[i - 1][1]
-            bx = path[i + 1][0] - path[i][0]
-            by = path[i + 1][1] - path[i][1]
-            na = math.hypot(ax, ay)
-            nb = math.hypot(bx, by)
-            if na < 1e-6 or nb < 1e-6:
-                continue
-            cosv = max(-1.0, min(1.0, (ax * bx + ay * by) / (na * nb)))
-            turn_penalty += abs(math.acos(cosv))
-        return length + 0.18 * turn_penalty - 0.03 * float(sample_count)
-
-    def choose_execution_exit_key(
+    def append_connector_to_route(
         self,
-        entry_base_key: NodeKey,
-        seed_key: NodeKey,
-        comp: Set[NodeKey],
-        attachments: Set[NodeKey],
-        preferred_exit_key: Optional[NodeKey],
-    ) -> NodeKey:
-        if entry_base_key not in self.nodes:
-            return entry_base_key
+        route: List[Tuple[float, float]],
+        from_node: Optional[Dict[str, object]],
+        to_node: Dict[str, object],
+    ) -> bool:
+        """Append a connector only when it is known safe.
 
-        ex, ey = self.nodes[entry_base_key]
-        direction = -1.0 if self.sweep_dir < 0.0 else 1.0
-        possible = set(attachments)
-        if preferred_exit_key is not None:
-            possible.add(preferred_exit_key)
-        possible.add(entry_base_key)
+        The old preview fallback appended the target even when there was no
+        safe local edge / graph path.  In RViz that creates a straight Path
+        segment across walls or unknown space.  This function now returns
+        False instead of drawing an unsafe connector, so the route builder can
+        skip that disconnected lane.
+        """
+        to_xy = self.local_node_xy(to_node)
+        if from_node is None:
+            if not route:
+                self.append_route_point(route, to_xy)
+                return True
+            if self.xy_line_is_repair_safe(route[-1], to_xy):
+                self.append_route_point(route, to_xy)
+                return True
+            return False
 
-        candidates: List[Tuple[float, NodeKey]] = []
-        for key in possible:
-            if key not in self.nodes:
-                continue
-            if key != entry_base_key and not any(nb in comp for nb in self.adj.get(key, set())):
-                continue
-            x, y = self.nodes[key]
-            along = (x - ex) * direction
-            same_lap_penalty = abs(y - ey)
-            if key == entry_base_key:
-                score = 1000.0
-            elif key in self.latest_scan_band and along >= -0.05:
-                score = same_lap_penalty - 2.0 * along
-            elif along >= -0.05:
-                score = 20.0 + same_lap_penalty - along
-            else:
-                score = 100.0 + same_lap_penalty + abs(along)
-            candidates.append((score, key))
+        from_xy = self.local_node_xy(from_node)
+        mask = self.active_hole_mask
+        if mask is not None and self.local_line_is_safe(mask, from_node, to_node):
+            self.append_route_point(route, to_xy)
+            return True
 
-        if not candidates:
-            return entry_base_key
-        candidates.sort(key=lambda item: item[0])
-        return candidates[0][1]
+        graph_path = self.local_graph_node_path(int(from_node['idx']), int(to_node['idx']))
+        if len(graph_path) >= 2:
+            appended = False
+            for idx in graph_path[1:]:
+                if 0 <= idx < len(self.local_repair_nodes):
+                    node_xy = self.local_node_xy(self.local_repair_nodes[idx])
+                    if route and not self.xy_line_is_safe_on_mask(route[-1], node_xy, mask):
+                        return False
+                    self.append_route_point(route, node_xy)
+                    appended = True
+            return appended
 
-    def build_resampled_repair_points(
-        self,
-        entry_base_key: NodeKey,
-        seed_key: NodeKey,
-        comp: Set[NodeKey],
-        attachments: Set[NodeKey],
-        preferred_exit_key: Optional[NodeKey],
-        start_xy: Optional[Tuple[float, float]] = None,
-        include_entry_prefix: bool = True,
-    ) -> Tuple[List[Tuple[float, float]], NodeKey, str]:
-        if entry_base_key not in self.nodes or seed_key not in self.nodes:
-            return [], entry_base_key, 'none'
+        return False
 
-        entry_xy = self.nodes[entry_base_key]
-        seed_xy = self.nodes[seed_key]
-        exit_key = self.choose_execution_exit_key(entry_base_key, seed_key, comp, attachments, preferred_exit_key)
-        exit_xy = self.nodes[exit_key] if exit_key in self.nodes else entry_xy
+    def build_local_repair_route_preview(self) -> None:
+        """
+        Build a one-stroke repair-route preview from LocalRepairRCG lanes.
 
-        # The axis is decided before entering the hole and then locked.
-        # Do not compare horizontal/vertical plans every replan cycle, because
-        # that is exactly what made the purple goal jump between corners.
-        if self.active_hole_repair_axis in ('horizontal', 'vertical'):
-            axis = self.active_hole_repair_axis
-        else:
-            axis = self.determine_locked_repair_axis(entry_base_key, seed_key)
-
-        mask = self.build_hole_repair_mask(comp, seed_key)
-        if mask is not None and np.count_nonzero(mask) > 0:
-            inner = self.resample_mask_axis(mask, axis, entry_xy, seed_xy, exit_xy)
-            path: List[Tuple[float, float]] = []
-            if include_entry_prefix:
-                self.append_xy_point(path, entry_xy, min_dist=0.02)
-                self.append_xy_point(path, seed_xy, min_dist=0.02)
-            elif start_xy is not None:
-                self.append_xy_point(path, start_xy, min_dist=0.02)
-
-            for pnt in inner:
-                if not self.append_safe_xy_connection(path, pnt, mask):
-                    continue
-            self.append_exit_connection(path, exit_xy, mask)
-
-            if len(path) >= max(2, self.hole_execution_min_path_points):
-                return path[:max(1, self.hole_repair_max_points)], exit_key, axis
-
-        # Conservative fallback: enter and leave without using unstable RCG
-        # ordering.  Keep the same locked axis label for logging.
-        path = []
-        if include_entry_prefix:
-            self.append_xy_point(path, entry_xy, min_dist=0.02)
-        elif start_xy is not None:
-            self.append_xy_point(path, start_xy, min_dist=0.02)
-        self.append_xy_point(path, seed_xy, min_dist=0.02)
-        self.append_xy_point(path, exit_xy, min_dist=0.02)
-        return path[:max(1, self.hole_repair_max_points)], exit_key, axis
-
-    def first_unreached_index_in_xy_path(
-        self,
-        path: List[Tuple[float, float]],
-        robot_xy: Tuple[float, float],
-        start_index: int = 0,
-    ) -> int:
-        idx = max(0, start_index)
-        while idx < len(path):
-            if self.distance_xy(path[idx], robot_xy) > max(self.hole_repair_finish_tolerance, 0.08):
-                return idx
-            idx += 1
-        return idx
-
-    def set_repair_sample_goal(self, index: int, reason: str = 'resampled hole repair step') -> None:
-        if index < 0 or index >= len(self.active_hole_repair_points):
-            self.active_hole_current_goal_xy = None
+        The route order is still decided by lane positions, not graph search.
+        Every connector shown in /cstar/hole_repair_path is now safety-checked:
+        unsafe fallback lines are skipped instead of being drawn through walls,
+        obstacles, or unknown-buffer cells.
+        """
+        self.local_repair_route_points = []
+        self.latest_hole_repair_path = []
+        if not self.local_repair_nodes:
             return
-        self.active_hole_repair_goal_index = index
-        self.active_hole_current_goal_xy = self.active_hole_repair_points[index]
-        self.current_goal_key = None
-        self.selected_path = self.active_hole_repair_points[index:]
-        x, y = self.active_hole_current_goal_xy
-        self.publish_goal_xy(x, y, reason)
 
-    def rebuild_resampled_repair_plan_from_current(self, robot_xy: Tuple[float, float]) -> bool:
+        lanes = self.local_repair_lane_groups()
+        if not lanes:
+            return
+        lanes = self.order_local_repair_lanes_for_route(lanes)
+
+        seed_xy: Optional[Tuple[float, float]] = None
+        if self.active_hole_seed_key is not None and self.active_hole_seed_key in self.nodes:
+            seed_xy = self.nodes[self.active_hole_seed_key]
+        entry_xy: Optional[Tuple[float, float]] = None
+        if self.active_hole_entry_base_key is not None and self.active_hole_entry_base_key in self.nodes:
+            entry_xy = self.nodes[self.active_hole_entry_base_key]
+
+        route: List[Tuple[float, float]] = []
+        if self.local_repair_route_include_entry_segment and entry_xy is not None and seed_xy is not None:
+            if self.xy_line_is_repair_safe(entry_xy, seed_xy):
+                self.append_route_point(route, entry_xy)
+                self.append_route_point(route, seed_xy)
+            else:
+                # Do not draw a doorway connector through a wall/unknown cell.
+                self.append_route_point(route, seed_xy)
+        elif seed_xy is not None:
+            self.append_route_point(route, seed_xy)
+        elif entry_xy is not None:
+            self.append_route_point(route, entry_xy)
+
+        prev_node: Optional[Dict[str, object]] = None
+        first_lane = True
+        forward = True
+        accepted_lanes = 0
+        for lane in lanes:
+            nodes = list(lane['nodes'])
+            if not nodes:
+                continue
+
+            if first_lane:
+                # Start the first accepted lane from the endpoint closer to the
+                # seed, so the route enters through the doorway side first.
+                if seed_xy is not None:
+                    first = nodes[0]
+                    last = nodes[-1]
+                    d_first = math.hypot(float(first['x']) - seed_xy[0], float(first['y']) - seed_xy[1])
+                    d_last = math.hypot(float(last['x']) - seed_xy[0], float(last['y']) - seed_xy[1])
+                    forward = d_first <= d_last
+                ordered_nodes = nodes if forward else list(reversed(nodes))
+            else:
+                ordered_nodes = nodes if forward else list(reversed(nodes))
+
+            if not self.append_connector_to_route(route, prev_node, ordered_nodes[0]):
+                # The chosen lane is disconnected from the current one under the
+                # safe mask.  Skip it instead of creating a straight unsafe Path
+                # segment across unknown/obstacle/wall space.
+                continue
+
+            for node in ordered_nodes[1:]:
+                node_xy = self.local_node_xy(node)
+                if route and not self.xy_line_is_safe_on_mask(route[-1], node_xy, self.active_hole_mask):
+                    break
+                self.append_route_point(route, node_xy)
+            prev_node = ordered_nodes[-1]
+            accepted_lanes += 1
+            first_lane = False
+            forward = not forward
+
+        if self.local_repair_route_include_exit_segment and route:
+            if self.active_hole_exit_key is not None and self.active_hole_exit_key in self.nodes:
+                exit_xy = self.nodes[self.active_hole_exit_key]
+                if self.xy_line_is_repair_safe(route[-1], exit_xy):
+                    self.append_route_point(route, exit_xy)
+
+        if accepted_lanes == 0:
+            route = []
+
+        self.local_repair_route_points = route
+        self.latest_hole_repair_path = list(route)
+
+    def update_hole_local_repair_debug(self) -> bool:
+        if self.active_hole_entry_base_key is None or self.active_hole_seed_key is None:
+            return False
         if self.active_hole_entry_base_key not in self.nodes or self.active_hole_seed_key not in self.nodes:
             return False
-
-        points, exit_key, axis = self.build_resampled_repair_points(
-            entry_base_key=self.active_hole_entry_base_key,  # type: ignore[arg-type]
-            seed_key=self.active_hole_seed_key,  # type: ignore[arg-type]
-            comp=self.active_hole_component,
-            attachments=self.active_hole_attachments,
-            preferred_exit_key=self.active_hole_exit_key,
-            start_xy=robot_xy,
-            include_entry_prefix=False,
+        ok = self.build_active_hole_mask(
+            self.active_hole_entry_base_key,
+            self.active_hole_seed_key,
+            self.active_hole_component,
         )
-        if not points:
-            return False
+        if ok:
+            self.build_local_repair_rcg()
+            if self.local_repair_build_route_preview:
+                self.build_local_repair_route_preview()
+            else:
+                self.local_repair_route_points = []
+                self.latest_hole_repair_path = []
+        return ok
 
-        self.active_hole_exit_key = exit_key
-        self.active_hole_repair_axis = axis
-        self.active_hole_repair_points = points
-        self.active_hole_repair_goal_index = self.first_unreached_index_in_xy_path(points, robot_xy, 0)
-        self.active_hole_repair_path = list(points)
-        self.latest_hole_repair_path = list(points)
-        self.latest_hole_exit_key = exit_key
-        return self.active_hole_repair_goal_index < len(self.active_hole_repair_points)
-
-    def build_execution_repair_path(
-        self,
-        entry_base_key: NodeKey,
-        seed_key: NodeKey,
-        comp: Set[NodeKey],
-        attachments: Set[NodeKey],
-        preferred_exit_key: Optional[NodeKey],
-    ) -> Tuple[List[NodeKey], List[Tuple[float, float]], Optional[NodeKey]]:
-        # Keep this public method name for compatibility with arm_hole_repair(),
-        # but return a resampled XY route instead of an RCG key route.
-        self.active_hole_repair_axis = self.determine_locked_repair_axis(entry_base_key, seed_key)
-        self.active_hole_repair_axis_locked = True
-        points, exit_key, axis = self.build_resampled_repair_points(
-            entry_base_key=entry_base_key,
-            seed_key=seed_key,
-            comp=comp,
-            attachments=attachments,
-            preferred_exit_key=preferred_exit_key,
-            include_entry_prefix=True,
-        )
-        self.active_hole_repair_axis = axis
-        return [], points, exit_key
-
-    def arm_hole_repair(
+    def arm_hole_local_repair_rcg(
         self,
         entry_base_key: NodeKey,
         seed_key: NodeKey,
         exit_key: Optional[NodeKey],
         component: Set[NodeKey],
         attachments: Set[NodeKey],
-        repair_path: List[Tuple[float, float]],
     ) -> None:
-        if entry_base_key not in self.nodes or seed_key not in self.nodes:
-            return
-        if not component:
-            return
-
-        _, xy_path, execution_exit_key = self.build_execution_repair_path(
-            entry_base_key=entry_base_key,
-            seed_key=seed_key,
-            comp=component,
-            attachments=attachments,
-            preferred_exit_key=exit_key,
-        )
-
-        if len(xy_path) < max(2, self.hole_execution_min_path_points):
-            self.get_logger().warn('Detected hole but resampled repair path is too short; keep detection only.')
+        """Arm LocalRepairRCG and prepare for entry-first repair execution."""
+        if entry_base_key not in self.nodes or seed_key not in self.nodes or not component:
             return
 
         self.mode = 'HOLE_ARMED'
@@ -2745,156 +2558,373 @@ class CStarWaypointPlannerNode(Node):
         self.active_hole_attachments = set(attachments)
         self.active_hole_entry_base_key = entry_base_key
         self.active_hole_seed_key = seed_key
-        self.active_hole_exit_key = execution_exit_key
-        self.active_hole_repair_path = list(xy_path)
-        self.active_hole_repair_points = list(xy_path)
-        self.active_hole_repair_key_path = []
-        self.active_hole_repair_goal_index = 0
+        self.active_hole_exit_key = exit_key
+        self.active_hole_mask = None
+        self.active_hole_roi = None
+        self.local_repair_nodes = []
+        self.local_repair_edges = set()
+        self.local_repair_route_points = []
+        self.active_hole_execute_route_points = []
+        self.active_hole_route_goal_index = 0
+        self.active_hole_route_progress_s = 0.0
         self.active_hole_current_goal_xy = None
-        self.active_hole_visited_repair_points = []
-        self.active_hole_branch_edge = (entry_base_key, seed_key)
+        self.active_hole_executed_route_points = []
+        self.set_active_hole_gate(entry_base_key, seed_key)
+        self.update_hole_local_repair_debug()
 
         self.latest_hole_component = set(component)
         self.latest_hole_attachments = set(attachments)
         self.latest_hole_entry_key = seed_key
-        self.latest_hole_exit_key = execution_exit_key
-        self.latest_hole_repair_path = list(xy_path)
+        self.latest_hole_exit_key = exit_key
+        self.latest_hole_repair_path = []
         self.latest_branch_edge = (entry_base_key, seed_key)
 
-        self.set_new_goal(entry_base_key, 'hole entry_base')
+        self.set_new_goal(entry_base_key, 'hole entry_base before LocalRepair execution')
         self.get_logger().info(
-            f'Hole repair armed with resampled path: entry_base={entry_base_key}, '
-            f'seed={seed_key}, exit={execution_exit_key}, points={len(xy_path)}, '
-            f'axis={self.active_hole_repair_axis}'
+            f'Hole LocalRepair execution armed: entry_base={entry_base_key}, '
+            f'seed={seed_key}, exit={exit_key}, local_nodes={len(self.local_repair_nodes)}, '
+            f'local_edges={len(self.local_repair_edges)}, axis={self.local_repair_axis}'
         )
 
+    def route_cumulative_lengths(self, route: List[Tuple[float, float]]) -> List[float]:
+        lengths: List[float] = []
+        total = 0.0
+        prev: Optional[Tuple[float, float]] = None
+        for xy in route:
+            if prev is not None:
+                total += self.distance_xy(prev, xy)
+            lengths.append(total)
+            prev = xy
+        return lengths
+
+    def project_progress_on_route(
+        self,
+        route: List[Tuple[float, float]],
+        xy: Tuple[float, float],
+    ) -> float:
+        if not route:
+            return 0.0
+        if len(route) == 1:
+            return 0.0
+        cum = self.route_cumulative_lengths(route)
+        best_d = float('inf')
+        best_s = 0.0
+        for i in range(len(route) - 1):
+            ax, ay = route[i]
+            bx, by = route[i + 1]
+            vx = bx - ax
+            vy = by - ay
+            seg_len2 = vx * vx + vy * vy
+            if seg_len2 < 1e-8:
+                continue
+            wx = xy[0] - ax
+            wy = xy[1] - ay
+            t = max(0.0, min(1.0, (wx * vx + wy * vy) / seg_len2))
+            px = ax + t * vx
+            py = ay + t * vy
+            d = math.hypot(xy[0] - px, xy[1] - py)
+            if d < best_d:
+                best_d = d
+                best_s = cum[i] + t * math.sqrt(seg_len2)
+        return best_s
+
+    def route_index_after_progress(
+        self,
+        route: List[Tuple[float, float]],
+        progress_s: float,
+    ) -> int:
+        if not route:
+            return 0
+        cum = self.route_cumulative_lengths(route)
+        target_s = progress_s + max(0.0, self.local_repair_min_progress_advance)
+        for i, s_val in enumerate(cum):
+            if s_val >= target_s:
+                return i
+        return len(route)
+
+    def nearest_route_index(self, route: List[Tuple[float, float]], xy: Tuple[float, float]) -> int:
+        if not route:
+            return 0
+        best_i = 0
+        best_d = float('inf')
+        for i, p in enumerate(route):
+            d = self.distance_xy(p, xy)
+            if d < best_d:
+                best_d = d
+                best_i = i
+        return best_i
+
+    def refresh_active_repair_route_from_latest_map(self, robot_xy: Tuple[float, float]) -> bool:
+        """Rebuild repair route during HOLE_REPAIR without locking the old path.
+
+        The latest map can reveal more of the hole after the robot reaches
+        entry_base.  This refresh updates active_hole_mask / LocalRepairRCG /
+        preview route and then re-anchors the executable route near the robot's
+        forward progress.  It avoids moving the purple goal backwards when the
+        current target is still present and safely connected.
+        """
+        if not self.local_repair_dynamic_update_during_execution:
+            return False
+        old_goal = self.active_hole_current_goal_xy
+        old_route = list(self.active_hole_execute_route_points)
+
+        if not self.update_hole_local_repair_debug():
+            return False
+        new_route = self.compact_xy_route(list(self.local_repair_route_points))
+        if len(new_route) < self.local_repair_min_execute_points:
+            return False
+
+        self.active_hole_execute_route_points = new_route
+        self.latest_hole_repair_path = list(new_route)
+
+        robot_s = self.project_progress_on_route(new_route, robot_xy)
+        old_goal_idx: Optional[int] = None
+        if old_goal is not None:
+            old_goal_idx = self.nearest_route_index(new_route, old_goal)
+            if old_goal_idx < len(new_route):
+                # If the current purple goal still lies on/near the updated route
+                # and the straight segment from robot to it is known safe, keep it
+                # until reached.  Otherwise select the next point by progress.
+                near_old_goal = self.distance_xy(new_route[old_goal_idx], old_goal) <= max(0.20, 2.0 * self.local_repair_goal_tolerance)
+                safe_to_goal = self.xy_line_is_repair_safe(robot_xy, new_route[old_goal_idx])
+                if near_old_goal and safe_to_goal:
+                    self.active_hole_route_goal_index = old_goal_idx
+                    self.active_hole_current_goal_xy = new_route[old_goal_idx]
+                    return True
+
+        self.active_hole_route_progress_s = max(self.active_hole_route_progress_s, robot_s)
+        idx = self.route_index_after_progress(new_route, self.active_hole_route_progress_s)
+        if idx >= len(new_route):
+            idx = max(0, len(new_route) - 1)
+        self.active_hole_route_goal_index = idx
+        self.active_hole_current_goal_xy = new_route[idx]
+        return old_route != new_route
+
+    def first_unreached_repair_route_index(
+        self,
+        route: List[Tuple[float, float]],
+        robot_xy: Tuple[float, float],
+        start_index: int = 0,
+    ) -> int:
+        tol = max(0.03, self.local_repair_goal_tolerance)
+        for idx in range(max(0, start_index), len(route)):
+            if self.distance_xy(route[idx], robot_xy) > tol:
+                return idx
+        return len(route)
+
+    def set_repair_route_goal(self, index: int) -> None:
+        if index < 0 or index >= len(self.active_hole_execute_route_points):
+            self.active_hole_current_goal_xy = None
+            return
+        self.active_hole_route_goal_index = index
+        xy = self.active_hole_execute_route_points[index]
+        self.active_hole_current_goal_xy = xy
+        self.current_goal_key = None
+        self.selected_path = [xy]
+        self.publish_xy_goal(xy)
+
+    def route_goal_reached_or_passed(
+        self,
+        robot_xy: Tuple[float, float],
+        index: int,
+    ) -> bool:
+        if index < 0 or index >= len(self.active_hole_execute_route_points):
+            return True
+
+        goal = self.active_hole_execute_route_points[index]
+        if self.distance_xy(robot_xy, goal) <= max(0.03, self.local_repair_goal_tolerance):
+            return True
+
+        if index <= 0:
+            return False
+
+        prev = self.active_hole_execute_route_points[index - 1]
+        vx = goal[0] - prev[0]
+        vy = goal[1] - prev[1]
+        seg_len2 = vx * vx + vy * vy
+        if seg_len2 < 1e-8:
+            return False
+
+        wx = robot_xy[0] - prev[0]
+        wy = robot_xy[1] - prev[1]
+        proj = (wx * vx + wy * vy) / seg_len2
+        if proj < 1.0:
+            return False
+
+        closest_x = prev[0] + proj * vx
+        closest_y = prev[1] + proj * vy
+        lateral = math.hypot(robot_xy[0] - closest_x, robot_xy[1] - closest_y)
+        return lateral <= max(self.local_repair_goal_tolerance, self.local_repair_goal_passed_tolerance)
+
+    def start_hole_repair_execution(self, robot_xy: Tuple[float, float]) -> bool:
+        if not self.local_repair_execute_route:
+            return False
+
+        # Start from the current route.  The route is allowed to update during
+        # HOLE_REPAIR as new laser data expands active_hole_mask, but the current
+        # purple goal is kept/re-anchored so it does not jump backwards.
+        route = list(self.local_repair_route_points)
+        route = self.compact_xy_route(route)
+        if len(route) < self.local_repair_min_execute_points:
+            self.get_logger().warn(
+                f'Cannot start hole repair: route points={len(route)} < '
+                f'{self.local_repair_min_execute_points}'
+            )
+            return False
+
+        self.mode = 'HOLE_REPAIR'
+        self.current_goal_key = None
+        self.escape_active = False
+        self.escape_path_xy.clear()
+        self.active_hole_execute_route_points = route
+        self.active_hole_executed_route_points = []
+        self.active_hole_route_progress_s = 0.0
+        self.latest_hole_repair_path = list(route)
+
+        idx = self.first_unreached_repair_route_index(route, robot_xy, start_index=0)
+        if idx >= len(route):
+            self.finish_hole_repair(robot_xy)
+            return True
+
+        self.set_repair_route_goal(idx)
+        self.get_logger().info(
+            f'Start LocalRepair route execution: points={len(route)}, start_index={idx}, '
+            f'entry={self.active_hole_entry_base_key}, exit={self.active_hole_exit_key}'
+        )
+        return True
+
+    def compact_xy_route(self, route: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+        compact: List[Tuple[float, float]] = []
+        min_dist = max(0.02, 0.5 * self.local_repair_goal_tolerance)
+        for xy in route:
+            if not compact or self.distance_xy(compact[-1], xy) >= min_dist:
+                compact.append((float(xy[0]), float(xy[1])))
+        return compact
+
     def handle_hole_armed(self, robot_xy: Tuple[float, float]) -> None:
+        """Drive to entry_base, then lock and execute the current repair route."""
         self.publish_empty_escape_path()
+        self.update_hole_local_repair_debug()
         if self.active_hole_entry_base_key is None or self.active_hole_entry_base_key not in self.nodes:
             self.abort_hole_execution('entry_base disappeared')
             return
 
-        if self.is_key_reached(
-            self.active_hole_entry_base_key,
-            robot_xy,
-            tolerance=max(self.goal_center_tolerance, 0.08),
-        ):
-            self.close_key(self.active_hole_entry_base_key)
-            self.mode = 'HOLE_REPAIR'
-            self.active_hole_repair_goal_index = self.first_unreached_index_in_xy_path(
-                self.active_hole_repair_points,
-                robot_xy,
-                start_index=0,
-            )
-            if self.active_hole_repair_goal_index >= len(self.active_hole_repair_points):
-                self.finish_hole_repair()
+        if self.is_key_reached(self.active_hole_entry_base_key, robot_xy, tolerance=max(self.goal_center_tolerance, self.local_repair_goal_tolerance)):
+            if self.start_hole_repair_execution(robot_xy):
                 return
-            self.set_repair_sample_goal(self.active_hole_repair_goal_index, 'start resampled hole repair')
+            self.abort_hole_execution('no executable LocalRepair route')
             return
 
-        self.set_new_goal(self.active_hole_entry_base_key, 'hole entry_base')
+        self.set_new_goal(self.active_hole_entry_base_key, 'hole entry_base before LocalRepair execution')
 
     def handle_hole_repair(self, robot_xy: Tuple[float, float]) -> None:
-        # Keep controller in ordinary /cstar/goal mode.  /cstar/escape_path is
-        # reserved for dead-end retreat only.
-        self.publish_empty_escape_path()
-
-        if not self.active_hole_repair_points:
-            if not self.rebuild_resampled_repair_plan_from_current(robot_xy):
-                self.abort_hole_execution('empty resampled repair plan')
-                return
-
-        if self.active_hole_current_goal_xy is None:
-            self.active_hole_repair_goal_index = self.first_unreached_index_in_xy_path(
-                self.active_hole_repair_points,
-                robot_xy,
-                start_index=self.active_hole_repair_goal_index,
-            )
-            if self.active_hole_repair_goal_index >= len(self.active_hole_repair_points):
-                self.finish_hole_repair()
-                return
-            self.set_repair_sample_goal(self.active_hole_repair_goal_index, 'resampled hole repair step')
+        if not self.active_hole_execute_route_points:
+            self.abort_hole_execution('empty executable repair route')
             return
 
-        if self.is_repair_goal_reached(robot_xy):
-            reached = self.active_hole_current_goal_xy
-            self.active_hole_visited_repair_points.append(reached)
-            self.add_closed_position(reached[0], reached[1])
+        # Keep route/mask synchronized with the latest map while the robot is
+        # already inside the hole.  This is deliberately not a full reset: the
+        # executable route is re-anchored near current forward progress.
+        self.refresh_active_repair_route_from_latest_map(robot_xy)
 
-            if self.repair_replan_on_reached:
-                # Optional: update only after reaching the current sample.
-                # The repair axis remains locked, so the plan cannot flip
-                # between horizontal and vertical boustrophedon forms.  Default
-                # is false for maximum stability.
-                if self.rebuild_resampled_repair_plan_from_current(robot_xy):
-                    self.set_repair_sample_goal(self.active_hole_repair_goal_index, 'updated locked-axis repair step')
-                    return
+        idx = self.active_hole_route_goal_index
+        advanced = False
+        while idx < len(self.active_hole_execute_route_points) and self.route_goal_reached_or_passed(robot_xy, idx):
+            reached_xy = self.active_hole_execute_route_points[idx]
+            self.active_hole_executed_route_points.append(reached_xy)
+            self.add_closed_position(reached_xy[0], reached_xy[1])
+            cum = self.route_cumulative_lengths(self.active_hole_execute_route_points)
+            if idx < len(cum):
+                self.active_hole_route_progress_s = max(self.active_hole_route_progress_s, cum[idx])
+            idx += 1
+            advanced = True
 
-            self.active_hole_repair_goal_index += 1
-            self.active_hole_repair_goal_index = self.first_unreached_index_in_xy_path(
-                self.active_hole_repair_points,
-                robot_xy,
-                start_index=self.active_hole_repair_goal_index,
-            )
-            if self.active_hole_repair_goal_index >= len(self.active_hole_repair_points):
-                self.finish_hole_repair()
-                return
-            self.set_repair_sample_goal(self.active_hole_repair_goal_index, 'resampled hole repair step')
+        if idx >= len(self.active_hole_execute_route_points):
+            self.finish_hole_repair(robot_xy)
             return
 
-        # Re-publish the current raw XY goal every timer cycle so controller
-        # restarts do not miss it.
-        if self.active_hole_current_goal_xy is not None:
-            x, y = self.active_hole_current_goal_xy
-            self.publish_goal_xy(x, y, 'resampled hole repair step')
+        if advanced or self.active_hole_current_goal_xy is None:
+            self.set_repair_route_goal(idx)
+        else:
+            # Keep the current purple target alive for controllers that start or
+            # reconnect after the planner.  Do not recompute it from the latest
+            # map during execution.
+            self.publish_xy_goal(self.active_hole_execute_route_points[idx])
 
-    def finish_hole_repair(self) -> None:
-        for key in self.active_hole_component:
-            if key in self.nodes:
-                self.closed_nodes.add(key)
-                x, y = self.nodes[key]
-                self.add_closed_position(x, y)
+    def close_global_rcg_nodes_in_active_hole_mask(self) -> int:
+        if not self.local_repair_close_active_mask_nodes:
+            return 0
+        if self.active_hole_mask is None:
+            return 0
+        closed = 0
+        for key, (x, y) in list(self.nodes.items()):
+            cell = self.world_to_cell(x, y)
+            if cell is None:
+                continue
+            r, c = cell
+            if 0 <= r < self.active_hole_mask.shape[0] and 0 <= c < self.active_hole_mask.shape[1]:
+                if bool(self.active_hole_mask[r, c]):
+                    before = key in self.closed_nodes
+                    self.close_key(key)
+                    if not before:
+                        closed += 1
+        return closed
 
-        for key in (
-            self.active_hole_entry_base_key,
-            self.active_hole_seed_key,
-            self.active_hole_exit_key,
-        ):
-            if key in self.nodes:
-                self.closed_nodes.add(key)
-                x, y = self.nodes[key]
-                self.add_closed_position(x, y)
-
-        for x, y in self.active_hole_repair_points:
+    def finish_hole_repair(self, robot_xy: Tuple[float, float]) -> None:
+        route = list(self.active_hole_execute_route_points)
+        for x, y in route:
             self.add_closed_position(x, y)
 
-        self.publish_empty_escape_path()
+        # Mark all global RCG nodes inside the final active_hole_mask as
+        # closed, not only the first doorway component.  This prevents newly
+        # revealed hole-internal RCG nodes from disturbing normal C* after the
+        # repair has finished.
+        closed_mask_nodes = self.close_global_rcg_nodes_in_active_hole_mask()
+        for key in list(self.active_hole_component):
+            if key in self.nodes:
+                self.close_key(key)
+        if self.active_hole_entry_base_key is not None and self.active_hole_entry_base_key in self.nodes:
+            self.close_key(self.active_hole_entry_base_key)
+
+        exit_key = self.active_hole_exit_key
+        if exit_key is not None and exit_key in self.nodes:
+            # End the repair near the exit attachment and let the normal C*
+            # policy choose the next open neighbor from that neighborhood.
+            self.close_key(exit_key)
+
         self.get_logger().info(
-            f'Resampled hole repair finished: samples={len(self.active_hole_repair_points)}, '
-            f'axis={self.active_hole_repair_axis}, exit={self.active_hole_exit_key}'
+            f'LocalRepair route finished: route_points={len(route)}, '
+            f'closed_component={len(self.active_hole_component)}, '
+            f'closed_mask_nodes={closed_mask_nodes}, resume_exit={exit_key}'
         )
 
         self.mode = 'COVERAGE'
+        self.current_goal_key = None
+        self.selected_path.clear()
+        self.escape_active = False
+        self.escape_path_xy.clear()
         self.active_hole_component.clear()
         self.active_hole_attachments.clear()
         self.active_hole_entry_base_key = None
         self.active_hole_seed_key = None
         self.active_hole_exit_key = None
-        self.active_hole_repair_path.clear()
-        self.active_hole_repair_key_path.clear()
-        self.active_hole_repair_points.clear()
-        self.active_hole_repair_goal_index = 0
+        self.active_hole_gate_origin = None
+        self.active_hole_gate_normal = None
+        self.active_hole_mask = None
+        self.active_hole_roi = None
+        self.local_repair_nodes = []
+        self.local_repair_edges = set()
+        self.local_repair_route_points = route
+        self.active_hole_execute_route_points = []
+        self.active_hole_route_goal_index = 0
+        self.active_hole_route_progress_s = 0.0
         self.active_hole_current_goal_xy = None
-        self.active_hole_branch_edge = None
-        self.active_hole_visited_repair_points.clear()
-        self.active_hole_repair_axis = 'resampled'
-        self.active_hole_repair_axis_locked = False
-        self.current_goal_key = None
-        self.selected_path.clear()
-        self.last_hole_update_time = None
+        self.active_hole_executed_route_points = []
+        self.latest_hole_repair_path = list(route)
+        self.publish_empty_escape_path()
 
     def abort_hole_execution(self, reason: str) -> None:
-        self.get_logger().warn(f'Hole execution aborted: {reason}')
+        self.get_logger().warn(f'Hole LocalRepair execution aborted: {reason}')
         self.publish_empty_escape_path()
         self.mode = 'COVERAGE'
         self.active_hole_component.clear()
@@ -2902,33 +2932,21 @@ class CStarWaypointPlannerNode(Node):
         self.active_hole_entry_base_key = None
         self.active_hole_seed_key = None
         self.active_hole_exit_key = None
-        self.active_hole_repair_path.clear()
-        self.active_hole_repair_key_path.clear()
-        self.active_hole_repair_points.clear()
-        self.active_hole_repair_goal_index = 0
+        self.active_hole_gate_origin = None
+        self.active_hole_gate_normal = None
+        self.active_hole_mask = None
+        self.active_hole_roi = None
+        self.local_repair_nodes = []
+        self.local_repair_edges = set()
+        self.local_repair_route_points = []
+        self.active_hole_execute_route_points = []
+        self.active_hole_route_goal_index = 0
+        self.active_hole_route_progress_s = 0.0
         self.active_hole_current_goal_xy = None
-        self.active_hole_branch_edge = None
-        self.active_hole_visited_repair_points.clear()
-        self.active_hole_repair_axis = 'resampled'
-        self.active_hole_repair_axis_locked = False
+        self.active_hole_executed_route_points = []
+        self.latest_hole_repair_path = []
         self.current_goal_key = None
         self.selected_path.clear()
-
-    def publish_escape_path(self, path: List[Tuple[float, float]]) -> None:
-        msg = Path()
-        msg.header.frame_id = self.map_frame
-        msg.header.stamp = self.get_clock().now().to_msg()
-
-        for x, y in path:
-            ps = PoseStamped()
-            ps.header = msg.header
-            ps.pose.position.x = x
-            ps.pose.position.y = y
-            ps.pose.position.z = 0.05
-            ps.pose.orientation.w = 1.0
-            msg.poses.append(ps)
-
-        self.escape_path_pub.publish(msg)
 
     def publish_empty_escape_path(self) -> None:
         msg = Path()
@@ -2948,17 +2966,17 @@ class CStarWaypointPlannerNode(Node):
             return
 
         nearest_key = self.nearest_node_key(robot_xy[0], robot_xy[1])
-        if nearest_key is None:
-            return
 
         # Hole execution states have priority over normal C* goal selection.
-        # During these states we do not run new hole detection and do not choose
-        # a new normal coverage goal.
+        # They may temporarily follow LocalRepair samples that are not exactly
+        # on a global RCG node, so do not require nearest_key here.
         if self.mode == 'HOLE_ARMED':
             self.handle_hole_armed(robot_xy)
         elif self.mode == 'HOLE_REPAIR':
             self.handle_hole_repair(robot_xy)
         else:
+            if nearest_key is None:
+                return
             self.mode = 'COVERAGE'
             reached_goal = self.is_reached_goal(robot_xy)
             current_key = nearest_key
@@ -3190,6 +3208,9 @@ class CStarWaypointPlannerNode(Node):
         self.publish_hole_markers(stamp)
         self.publish_entry_exit_markers(stamp)
         self.publish_hole_repair_path(stamp)
+        self.publish_hole_gate_markers(stamp)
+        self.publish_active_hole_mask_marker(stamp)
+        self.publish_local_repair_rcg_outputs(stamp)
 
     def publish_hole_nodes(self, stamp) -> None:
         msg = PoseArray()
@@ -3328,19 +3349,18 @@ class CStarWaypointPlannerNode(Node):
         return m
 
     def publish_hole_repair_path(self, stamp) -> None:
+        """Publish the non-executable LocalRepairRCG one-stroke route preview."""
         msg = Path()
         msg.header.frame_id = self.map_frame
         msg.header.stamp = stamp
-
         for x, y in self.latest_hole_repair_path:
             ps = PoseStamped()
             ps.header = msg.header
-            ps.pose.position.x = x
-            ps.pose.position.y = y
-            ps.pose.position.z = 0.05
+            ps.pose.position.x = float(x)
+            ps.pose.position.y = float(y)
+            ps.pose.position.z = 0.10
             ps.pose.orientation.w = 1.0
             msg.poses.append(ps)
-
         self.hole_repair_path_pub.publish(msg)
 
         ma = MarkerArray()
@@ -3353,26 +3373,203 @@ class CStarWaypointPlannerNode(Node):
         line = Marker()
         line.header.frame_id = self.map_frame
         line.header.stamp = stamp
-        line.ns = 'hole_repair_path'
+        line.ns = 'local_repair_route_preview'
         line.id = 0
         line.type = Marker.LINE_STRIP
         line.action = Marker.ADD
-        line.scale.x = 0.035
+        line.scale.x = 0.045
         line.color.r = 1.0
-        line.color.g = 0.2
-        line.color.b = 0.0
-        line.color.a = 0.90
+        line.color.g = 0.15
+        line.color.b = 0.05
+        line.color.a = 0.95
         line.pose.orientation.w = 1.0
 
+        points = Marker()
+        points.header.frame_id = self.map_frame
+        points.header.stamp = stamp
+        points.ns = 'local_repair_route_points'
+        points.id = 1
+        points.type = Marker.SPHERE_LIST
+        points.action = Marker.ADD
+        points.scale.x = 0.08
+        points.scale.y = 0.08
+        points.scale.z = 0.08
+        points.color.r = 1.0
+        points.color.g = 0.05
+        points.color.b = 0.05
+        points.color.a = 0.90
+        points.pose.orientation.w = 1.0
+
         for x, y in self.latest_hole_repair_path:
-            p = Point()
-            p.x = x
-            p.y = y
-            p.z = 0.13
+            p = Point(); p.x = float(x); p.y = float(y); p.z = 0.20
             line.points.append(p)
+            pp = Point(); pp.x = float(x); pp.y = float(y); pp.z = 0.22
+            points.points.append(pp)
 
         ma.markers.append(line)
+        ma.markers.append(points)
         self.hole_repair_markers_pub.publish(ma)
+
+    def publish_hole_gate_markers(self, stamp) -> None:
+        ma = MarkerArray()
+        delete_all = Marker()
+        delete_all.header.frame_id = self.map_frame
+        delete_all.header.stamp = stamp
+        delete_all.action = Marker.DELETEALL
+        ma.markers.append(delete_all)
+
+        if self.active_hole_gate_origin is not None and self.active_hole_gate_normal is not None:
+            ox, oy = self.active_hole_gate_origin
+            nx, ny = self.active_hole_gate_normal
+            tx, ty = -ny, nx
+
+            length = max(0.5, self.local_repair_gate_viz_length)
+            if self.active_hole_mask is not None and self.free_msg is not None and np.any(self.active_hole_mask):
+                rows, cols = np.where(self.active_hole_mask)
+                res = self.free_msg.info.resolution
+                extent = max((rows.max() - rows.min() + 1) * res, (cols.max() - cols.min() + 1) * res)
+                length = max(length, 0.75 * extent)
+
+            gate_line = Marker()
+            gate_line.header.frame_id = self.map_frame
+            gate_line.header.stamp = stamp
+            gate_line.ns = 'hole_virtual_gate_line'
+            gate_line.id = 0
+            gate_line.type = Marker.LINE_LIST
+            gate_line.action = Marker.ADD
+            gate_line.scale.x = 0.045
+            gate_line.color.r = 1.0
+            gate_line.color.g = 1.0
+            gate_line.color.b = 0.0
+            gate_line.color.a = 0.95
+            gate_line.pose.orientation.w = 1.0
+            p1 = Point(); p1.x = ox - tx * length; p1.y = oy - ty * length; p1.z = 0.24
+            p2 = Point(); p2.x = ox + tx * length; p2.y = oy + ty * length; p2.z = 0.24
+            gate_line.points.append(p1); gate_line.points.append(p2)
+            ma.markers.append(gate_line)
+
+            normal_arrow = Marker()
+            normal_arrow.header.frame_id = self.map_frame
+            normal_arrow.header.stamp = stamp
+            normal_arrow.ns = 'hole_gate_normal_arrow'
+            normal_arrow.id = 1
+            normal_arrow.type = Marker.ARROW
+            normal_arrow.action = Marker.ADD
+            normal_arrow.scale.x = 0.04
+            normal_arrow.scale.y = 0.09
+            normal_arrow.scale.z = 0.09
+            normal_arrow.color.r = 0.0
+            normal_arrow.color.g = 1.0
+            normal_arrow.color.b = 0.2
+            normal_arrow.color.a = 0.95
+            normal_arrow.pose.orientation.w = 1.0
+            a0 = Point(); a0.x = ox; a0.y = oy; a0.z = 0.26
+            a1 = Point(); a1.x = ox + nx * 0.55; a1.y = oy + ny * 0.55; a1.z = 0.26
+            normal_arrow.points.append(a0); normal_arrow.points.append(a1)
+            ma.markers.append(normal_arrow)
+
+        self.hole_gate_markers_pub.publish(ma)
+
+    def publish_active_hole_mask_marker(self, stamp) -> None:
+        marker = Marker()
+        marker.header.frame_id = self.map_frame
+        marker.header.stamp = stamp
+        marker.ns = 'active_hole_mask_cells'
+        marker.id = 0
+        marker.type = Marker.CUBE_LIST
+        marker.action = Marker.ADD
+        marker.pose.orientation.w = 1.0
+        marker.color.r = 0.8
+        marker.color.g = 0.0
+        marker.color.b = 1.0
+        marker.color.a = 0.28
+
+        if self.active_hole_mask is not None and self.free_msg is not None:
+            res = self.free_msg.info.resolution
+            stride = max(1, self.local_repair_mask_viz_stride)
+            marker.scale.x = res * stride
+            marker.scale.y = res * stride
+            marker.scale.z = 0.02
+            rows, cols = np.where(self.active_hole_mask)
+            for r, c in zip(rows, cols):
+                if int(r) % stride != 0 or int(c) % stride != 0:
+                    continue
+                x, y = self.local_cell_to_world(int(r), int(c))
+                p = Point(); p.x = x; p.y = y; p.z = 0.04
+                marker.points.append(p)
+        else:
+            marker.scale.x = 0.05
+            marker.scale.y = 0.05
+            marker.scale.z = 0.02
+
+        self.active_hole_mask_markers_pub.publish(marker)
+
+    def publish_local_repair_rcg_outputs(self, stamp) -> None:
+        pose_msg = PoseArray()
+        pose_msg.header.frame_id = self.map_frame
+        pose_msg.header.stamp = stamp
+        for node in self.local_repair_nodes:
+            pose = Pose()
+            pose.position.x = float(node['x'])
+            pose.position.y = float(node['y'])
+            pose.position.z = 0.06
+            pose.orientation.w = 1.0
+            pose_msg.poses.append(pose)
+        self.local_repair_rcg_nodes_pub.publish(pose_msg)
+
+        ma = MarkerArray()
+        delete_all = Marker()
+        delete_all.header.frame_id = self.map_frame
+        delete_all.header.stamp = stamp
+        delete_all.action = Marker.DELETEALL
+        ma.markers.append(delete_all)
+
+        nodes_marker = Marker()
+        nodes_marker.header.frame_id = self.map_frame
+        nodes_marker.header.stamp = stamp
+        nodes_marker.ns = 'local_repair_rcg_nodes'
+        nodes_marker.id = 0
+        nodes_marker.type = Marker.SPHERE_LIST
+        nodes_marker.action = Marker.ADD
+        nodes_marker.scale.x = 0.065
+        nodes_marker.scale.y = 0.065
+        nodes_marker.scale.z = 0.065
+        nodes_marker.color.r = 1.0
+        nodes_marker.color.g = 0.45
+        nodes_marker.color.b = 0.0
+        nodes_marker.color.a = 0.95
+        nodes_marker.pose.orientation.w = 1.0
+
+        edge_marker = Marker()
+        edge_marker.header.frame_id = self.map_frame
+        edge_marker.header.stamp = stamp
+        edge_marker.ns = 'local_repair_rcg_edges'
+        edge_marker.id = 1
+        edge_marker.type = Marker.LINE_LIST
+        edge_marker.action = Marker.ADD
+        edge_marker.scale.x = 0.025
+        edge_marker.color.r = 1.0
+        edge_marker.color.g = 0.65
+        edge_marker.color.b = 0.0
+        edge_marker.color.a = 0.70
+        edge_marker.pose.orientation.w = 1.0
+
+        for node in self.local_repair_nodes:
+            p = Point(); p.x = float(node['x']); p.y = float(node['y']); p.z = 0.16
+            nodes_marker.points.append(p)
+
+        for i, j in sorted(self.local_repair_edges):
+            if i < 0 or j < 0 or i >= len(self.local_repair_nodes) or j >= len(self.local_repair_nodes):
+                continue
+            ni = self.local_repair_nodes[i]
+            nj = self.local_repair_nodes[j]
+            p1 = Point(); p1.x = float(ni['x']); p1.y = float(ni['y']); p1.z = 0.12
+            p2 = Point(); p2.x = float(nj['x']); p2.y = float(nj['y']); p2.z = 0.12
+            edge_marker.points.append(p1); edge_marker.points.append(p2)
+
+        ma.markers.append(nodes_marker)
+        ma.markers.append(edge_marker)
+        self.local_repair_rcg_markers_pub.publish(ma)
 
 
 
