@@ -1,3 +1,0 @@
-[console_scripts]
-cstar_waypoint_planner_node = cstar_planner.cstar_waypoint_planner_node:main
-

@@ -1,9 +1,0 @@
-source;share/cstar_planner/hook/pythonpath.ps1
-source;share/cstar_planner/hook/pythonpath.dsv
-source;share/cstar_planner/hook/pythonpath.sh
-source;share/cstar_planner/hook/ament_prefix_path.ps1
-source;share/cstar_planner/hook/ament_prefix_path.dsv
-source;share/cstar_planner/hook/ament_prefix_path.sh
-source;../../build/cstar_planner/share/cstar_planner/hook/pythonpath_develop.ps1
-source;../../build/cstar_planner/share/cstar_planner/hook/pythonpath_develop.dsv
-source;../../build/cstar_planner/share/cstar_planner/hook/pythonpath_develop.sh
